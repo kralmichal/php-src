@@ -5582,22 +5582,46 @@ static bool zend_str_method_returns_string(zval *method_name) /* {{{ */
 }
 /* }}} */
 
-/* True if the expression is a compile-time-known string for the purpose of
- * dispatching scalar methods to the Str backing class. This covers string
- * literals, explicit (string) casts, and — to support method chaining — a
- * `<static-string>-><method>()` call whose Str method is declared to return
- * `string` (so the call's result is itself a static-string receiver). */
+/* True if the expression is guaranteed to evaluate to a string for the purpose
+ * of dispatching scalar methods to the Str backing class. This covers:
+ *   - string literals (ZEND_AST_ZVAL holding an IS_STRING zval);
+ *   - explicit (string) casts — and (binary) casts, which the scanner maps to
+ *     the same T_STRING_CAST token, so both are ZEND_AST_CAST with attr IS_STRING;
+ *   - string concatenation (`a . b`), which the parser builds as a
+ *     ZEND_AST_BINARY_OP whose opcode (stored in ->attr) is ZEND_CONCAT. The
+ *     concat operator always yields a string regardless of operand types. We
+ *     match ZEND_CONCAT *specifically*: arithmetic/bitwise binary ops (ZEND_ADD,
+ *     ZEND_SUB, ...) share the ZEND_AST_BINARY_OP kind but do NOT produce strings,
+ *     so they must not be treated as string receivers;
+ *   - interpolated double-quoted strings and heredocs with interpolation, which
+ *     the parser represents as ZEND_AST_ENCAPS_LIST and which always produce a
+ *     string (a non-interpolated "foo" is a plain ZEND_AST_ZVAL literal, already
+ *     covered above);
+ *   - to support method chaining, a `<string-receiver>-><method>()` call whose
+ *     Str method is declared to return `string` (so the call's result is itself
+ *     a string receiver). */
 static bool zend_is_static_string_ast(zend_ast *ast) /* {{{ */
 {
 	if (ast->kind == ZEND_AST_ZVAL) {
 		return Z_TYPE_P(zend_ast_get_zval(ast)) == IS_STRING;
 	}
 	if (ast->kind == ZEND_AST_CAST) {
+		/* (string) and (binary) casts both carry attr == IS_STRING. */
 		return ast->attr == IS_STRING;
 	}
-	/* Chaining: a method call on a static-string receiver with a literal method
-	 * name that resolves to a string-returning Str method is itself a static
-	 * string. nullsafe (`?->`) is deliberately excluded. */
+	/* Concatenation always yields a string. Match the ZEND_CONCAT opcode only —
+	 * other ZEND_AST_BINARY_OP nodes (e.g. ZEND_ADD) are not strings. */
+	if (ast->kind == ZEND_AST_BINARY_OP) {
+		return ast->attr == ZEND_CONCAT;
+	}
+	/* Interpolated double-quoted strings and interpolated heredocs are encaps
+	 * lists and always evaluate to a string. */
+	if (ast->kind == ZEND_AST_ENCAPS_LIST) {
+		return true;
+	}
+	/* Chaining: a method call on a string receiver with a literal method
+	 * name that resolves to a string-returning Str method is itself a string.
+	 * nullsafe (`?->`) is deliberately excluded. */
 	if (ast->kind == ZEND_AST_METHOD_CALL) {
 		zend_ast *recv_ast = ast->child[0];
 		zend_ast *method_ast = ast->child[1];
