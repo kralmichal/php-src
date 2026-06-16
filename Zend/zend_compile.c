@@ -101,6 +101,7 @@ static zend_op *zend_delayed_compile_var(znode *result, zend_ast *ast, uint32_t 
 static void zend_compile_expr(znode *result, zend_ast *ast);
 static void zend_compile_stmt(zend_ast *ast);
 static void zend_compile_assign(znode *result, zend_ast *ast, bool stmt, uint32_t type);
+static void zend_compile_static_call(znode *result, zend_ast *ast, uint32_t type);
 
 #ifdef ZEND_CHECK_STACK_LIMIT
 zend_never_inline static void zend_stack_limit_error(void)
@@ -570,6 +571,26 @@ static uint32_t lookup_cv(zend_string *name) /* {{{ */{
 }
 /* }}} */
 
+/* Returns the synthesized type info of an already-declared typed local with this name,
+ * or NULL if no such CV exists or it is untyped. Does NOT create a CV (unlike lookup_cv),
+ * so it is safe to probe from compile paths that must reject typed locals. */
+static zend_property_info *zend_find_typed_local(zend_string *name) /* {{{ */
+{
+	zend_op_array *op_array = CG(active_op_array);
+	if (!op_array->cv_types) {
+		return NULL;
+	}
+	zend_ulong hash_value = zend_string_hash_val(name);
+	for (int i = 0; i < op_array->last_var; i++) {
+		if (ZSTR_H(op_array->vars[i]) == hash_value
+		 && zend_string_equals(op_array->vars[i], name)) {
+			return op_array->cv_types[i];
+		}
+	}
+	return NULL;
+}
+/* }}} */
+
 zend_string *zval_make_interned_string(zval *zv)
 {
 	ZEND_ASSERT(Z_TYPE_P(zv) == IS_STRING);
@@ -770,6 +791,7 @@ bool zend_op_may_elide_result(uint8_t opcode)
 		case ZEND_ASSIGN_OBJ:
 		case ZEND_ASSIGN_STATIC_PROP:
 		case ZEND_ASSIGN_OP:
+		case ZEND_ASSIGN_OP_TYPED:
 		case ZEND_ASSIGN_DIM_OP:
 		case ZEND_ASSIGN_OBJ_OP:
 		case ZEND_ASSIGN_STATIC_PROP_OP:
@@ -779,6 +801,8 @@ bool zend_op_may_elide_result(uint8_t opcode)
 		case ZEND_PRE_DEC_OBJ:
 		case ZEND_PRE_INC:
 		case ZEND_PRE_DEC:
+		case ZEND_PRE_INC_TYPED:
+		case ZEND_PRE_DEC_TYPED:
 		case ZEND_DO_FCALL:
 		case ZEND_DO_ICALL:
 		case ZEND_DO_UCALL:
@@ -814,7 +838,9 @@ static void zend_do_free(znode *op1) /* {{{ */
 				case ZEND_POST_DEC_OBJ:
 				case ZEND_POST_INC:
 				case ZEND_POST_DEC:
-					/* convert $i++ to ++$i */
+				case ZEND_POST_INC_TYPED:
+				case ZEND_POST_DEC_TYPED:
+					/* convert $i++ to ++$i (POST_*_TYPED = PRE_*_TYPED + 2) */
 					opline->opcode -= 2;
 					SET_UNUSED(opline->result);
 					return;
@@ -3725,7 +3751,18 @@ static void zend_compile_compound_assign(znode *result, zend_ast *ast) /* {{{ */
 			zend_delayed_compile_var(&var_node, var_ast, BP_VAR_RW, false);
 			zend_compile_expr(&expr_node, expr_ast);
 			zend_delayed_compile_end(offset);
-			opline = zend_emit_op_tmp(result, ZEND_ASSIGN_OP, &var_node, &expr_node);
+			/* If the target is a typed local CV, enforce the declared type on the
+			 * result of the compound operation by emitting ZEND_ASSIGN_OP_TYPED
+			 * instead of plain ZEND_ASSIGN_OP, mirroring the ZEND_ASSIGN_TYPED
+			 * choice in zend_compile_assign(). Only simple CV targets are typed;
+			 * dynamic/auto-global $$vars compile to a non-CV var_node and fall
+			 * through to plain ZEND_ASSIGN_OP unchanged. */
+			if (var_node.op_type == IS_CV && CG(active_op_array)->cv_types
+			 && CG(active_op_array)->cv_types[EX_VAR_TO_NUM(var_node.u.op.var)]) {
+				opline = zend_emit_op_tmp(result, ZEND_ASSIGN_OP_TYPED, &var_node, &expr_node);
+			} else {
+				opline = zend_emit_op_tmp(result, ZEND_ASSIGN_OP, &var_node, &expr_node);
+			}
 			opline->extended_value = opcode;
 			return;
 		case ZEND_AST_STATIC_PROP:
@@ -5505,11 +5542,365 @@ static void zend_compile_call(znode *result, const zend_ast *ast, uint32_t type)
 }
 /* }}} */
 
+static bool zend_is_static_string_ast(zend_ast *ast);
+
+/* True if `type` is a declared, non-nullable, plain `string` type — i.e. exactly
+ * `string` and nothing else: not `?string`/`string|null`, not a union such as
+ * `string|int`, not `mixed`, not a class/intersection type. The MAY_BE_* mask must
+ * be precisely MAY_BE_STRING (the nullable bit lives inside that mask and equals
+ * MAY_BE_NULL, so the equality already rejects nullable), and the type must carry
+ * no class-name/list (complex) component. This is the property we need to *prove*
+ * a value is guaranteed to be a non-nullable string at compile time. */
+static bool zend_type_is_nonnullable_string(zend_type type) /* {{{ */
+{
+	return ZEND_TYPE_IS_SET(type)
+		&& !ZEND_TYPE_IS_COMPLEX(type)
+		&& ZEND_TYPE_PURE_MASK(type) == MAY_BE_STRING;
+}
+/* }}} */
+
+/* True if the function/method has a *declared* return type that is guaranteed to be
+ * a non-nullable `string` (see zend_type_is_nonnullable_string). A function with no
+ * declared return type is rejected: we cannot prove it returns a string. */
+static bool zend_fn_returns_nonnullable_string(const zend_function *fbc) /* {{{ */
+{
+	if (!(fbc->common.fn_flags & ZEND_ACC_HAS_RETURN_TYPE)) {
+		return false;
+	}
+	/* arg_info[-1] is the return type slot when a return type is declared. */
+	const zend_arg_info *return_info = fbc->common.arg_info - 1;
+	return zend_type_is_nonnullable_string(return_info->type);
+}
+/* }}} */
+
+/* True if `Str::<method_name>` exists and is declared to return a non-nullable
+ * `string`. Used to decide whether a `<static-string>-><method>()` call may itself
+ * act as a static string receiver for chaining (e.g. `"..."->trim()->upper()`).
+ * This is real return-type introspection: the Str class is an internal class
+ * registered at MINIT, so it is always present in the class table during
+ * compilation, and zend_lookup_class() does not autoload while compiling (it
+ * returns NULL instead). Methods such as length() that return int are intentionally
+ * rejected, so the int result is not treated as a chainable string receiver. */
+static bool zend_str_method_returns_string(zval *method_name) /* {{{ */
+{
+	if (Z_TYPE_P(method_name) != IS_STRING) {
+		return false;
+	}
+
+	zend_string *class_name = ZSTR_INIT_LITERAL("Str", 0);
+	zend_class_entry *ce = zend_lookup_class(class_name);
+	zend_string_release(class_name);
+	if (!ce) {
+		return false;
+	}
+
+	zend_string *lcname = zend_string_tolower(Z_STR_P(method_name));
+	const zend_function *fbc = zend_hash_find_ptr(&ce->function_table, lcname);
+	zend_string_release(lcname);
+	if (!fbc) {
+		return false;
+	}
+
+	return zend_fn_returns_nonnullable_string(fbc);
+}
+/* }}} */
+
+/* Tier 2 receiver: `$this->prop` where the *current* class declares `prop` as a
+ * plain, non-hooked, non-static, non-virtual property typed exactly non-nullable
+ * `string`. Declared typed properties bypass __get, so reading such a property is
+ * guaranteed to yield a string (a typed `string` property that is never assigned
+ * throws on read rather than yielding a non-string, which is fine — desugaring or
+ * not, the access errors). We resolve the property_info from the current class's
+ * properties_info table at compile time. Hooked (8.4 hooks), virtual, magic, static,
+ * or non-`string` properties are rejected, as is any access when the scope isn't
+ * statically known (closures rebindable; traits resolve `self` to the using class).
+ * The key into properties_info is the *unmangled* property name. */
+static bool zend_this_prop_is_nonnullable_string(zend_string *prop_name) /* {{{ */
+{
+	zend_class_entry *ce = CG(active_class_entry);
+	if (!ce || !zend_is_scope_known()) {
+		return false;
+	}
+
+	const zend_property_info *info = zend_hash_find_ptr(&ce->properties_info, prop_name);
+	if (!info) {
+		return false;
+	}
+
+	/* Only a plain instance property with backing storage and no hooks bypasses
+	 * __get and is a guaranteed direct read. */
+	if ((info->flags & (ZEND_ACC_STATIC | ZEND_ACC_VIRTUAL)) || info->hooks != NULL) {
+		return false;
+	}
+
+	return zend_type_is_nonnullable_string(info->type);
+}
+/* }}} */
+
+/* Tier 2 receiver helper: resolve a `self::`/`static::`/`parent::` static-call class
+ * keyword to its compile-time class entry, or NULL if not resolvable now. `self` and
+ * `static` resolve to the current class (for `static`, late static binding may pick
+ * an overriding method in a subclass, but PHP return-type variance forbids widening a
+ * `: string` return, so any override still returns a non-nullable string — the return
+ * type is therefore safe regardless of which method runs). `parent` resolves only when
+ * the current class is already linked; otherwise ce->parent is still a name string and
+ * must not be dereferenced, so we fall through. Requires a statically known scope. */
+static zend_class_entry *zend_resolve_self_parent_static_ce(zend_ast *class_ast) /* {{{ */
+{
+	if (class_ast->kind != ZEND_AST_ZVAL || Z_TYPE_P(zend_ast_get_zval(class_ast)) != IS_STRING) {
+		return NULL;
+	}
+
+	zend_class_entry *ce = CG(active_class_entry);
+	if (!ce || !zend_is_scope_known()) {
+		return NULL;
+	}
+
+	uint32_t fetch_type = zend_get_class_fetch_type_ast(class_ast);
+	switch (fetch_type) {
+		case ZEND_FETCH_CLASS_SELF:
+		case ZEND_FETCH_CLASS_STATIC:
+			return ce;
+		case ZEND_FETCH_CLASS_PARENT:
+			if (ce->ce_flags & ZEND_ACC_LINKED) {
+				return ce->parent;
+			}
+			return NULL;
+		default:
+			return NULL;
+	}
+}
+/* }}} */
+
+/* Tier 2 receiver: a call whose result is *provably* a non-nullable `string`,
+ * resolvable at compile time. Handles three call forms:
+ *   - `$this->m()`        — method on the current class (resolved via its method
+ *                            table). An overriding method in a subclass may actually
+ *                            run, but return-type variance forbids widening a `:string`
+ *                            return, so the result is guaranteed a non-nullable string.
+ *   - `self::m()` / `static::m()` / `parent::m()`
+ *                          — resolved via the current (or parent) class.
+ *   - `f()`               — a plain function call with a literal, unambiguous name
+ *                            that resolves to an internal function (always available)
+ *                            or to an already-declared, finalized user function present
+ *                            in CG(function_table) at this compile point.
+ * nullsafe (`?->`) is excluded (it is a distinct AST kind). Anything not provably a
+ * non-nullable-string return falls through. */
+static bool zend_call_ast_returns_nonnullable_string(zend_ast *ast) /* {{{ */
+{
+	if (ast->kind == ZEND_AST_METHOD_CALL) {
+		/* Only `$this->m(...)` with a literal method name on the current class. */
+		zend_ast *obj_ast = ast->child[0];
+		zend_ast *method_ast = ast->child[1];
+		if (!is_this_fetch(obj_ast)
+		 || method_ast->kind != ZEND_AST_ZVAL
+		 || Z_TYPE_P(zend_ast_get_zval(method_ast)) != IS_STRING) {
+			return false;
+		}
+		zend_class_entry *ce = CG(active_class_entry);
+		if (!ce || !zend_is_scope_known()) {
+			return false;
+		}
+		zend_string *lcname = zend_string_tolower(Z_STR_P(zend_ast_get_zval(method_ast)));
+		const zend_function *fbc = zend_hash_find_ptr(&ce->function_table, lcname);
+		zend_string_release(lcname);
+		return fbc && zend_fn_returns_nonnullable_string(fbc);
+	}
+
+	if (ast->kind == ZEND_AST_STATIC_CALL) {
+		/* `self::m()` / `static::m()` / `parent::m()` with a literal method name. */
+		zend_ast *class_ast = ast->child[0];
+		zend_ast *method_ast = ast->child[1];
+		if (method_ast->kind != ZEND_AST_ZVAL
+		 || Z_TYPE_P(zend_ast_get_zval(method_ast)) != IS_STRING) {
+			return false;
+		}
+		zend_class_entry *ce = zend_resolve_self_parent_static_ce(class_ast);
+		if (!ce) {
+			return false;
+		}
+		zend_string *lcname = zend_string_tolower(Z_STR_P(zend_ast_get_zval(method_ast)));
+		const zend_function *fbc = zend_hash_find_ptr(&ce->function_table, lcname);
+		zend_string_release(lcname);
+		return fbc && zend_fn_returns_nonnullable_string(fbc);
+	}
+
+	if (ast->kind == ZEND_AST_CALL) {
+		/* Plain `f(...)` with a literal function name. Resolve ONLY when the name is
+		 * unambiguous (not a namespace-relative name that needs runtime global
+		 * fallback) and the callee is already present in the function table now:
+		 * an internal function (always registered) or a finalized user function
+		 * (one whose declaration has completed pass two). A not-yet-declared or
+		 * conditionally-declared user function is not resolvable here and falls
+		 * through — this is the documented declaration-order limitation. */
+		zend_ast *name_ast = ast->child[0];
+		if (name_ast->kind != ZEND_AST_ZVAL || Z_TYPE_P(zend_ast_get_zval(name_ast)) != IS_STRING) {
+			return false;
+		}
+
+		znode name_node;
+		bool runtime_resolution = zend_compile_function_name(&name_node, name_ast);
+		/* zend_compile_function_name resolves into a refcounted string we own here;
+		 * we are only probing, not emitting, so we must release it. */
+		if (runtime_resolution) {
+			zval_ptr_dtor(&name_node.u.constant);
+			return false;
+		}
+
+		zend_string *lcname = zend_string_tolower(Z_STR(name_node.u.constant));
+		zval_ptr_dtor(&name_node.u.constant);
+		const zend_function *fbc = zend_hash_find_ptr(CG(function_table), lcname);
+		zend_string_release(lcname);
+		if (!fbc || !fbc_is_finalized(fbc)) {
+			return false;
+		}
+		return zend_fn_returns_nonnullable_string(fbc);
+	}
+
+	return false;
+}
+/* }}} */
+
+/* True if the expression is guaranteed to evaluate to a string for the purpose
+ * of dispatching scalar methods to the Str backing class. This covers:
+ *   - string literals (ZEND_AST_ZVAL holding an IS_STRING zval);
+ *   - explicit (string) casts — and (binary) casts, which the scanner maps to
+ *     the same T_STRING_CAST token, so both are ZEND_AST_CAST with attr IS_STRING;
+ *   - string concatenation (`a . b`), which the parser builds as a
+ *     ZEND_AST_BINARY_OP whose opcode (stored in ->attr) is ZEND_CONCAT. The
+ *     concat operator always yields a string regardless of operand types. We
+ *     match ZEND_CONCAT *specifically*: arithmetic/bitwise binary ops (ZEND_ADD,
+ *     ZEND_SUB, ...) share the ZEND_AST_BINARY_OP kind but do NOT produce strings,
+ *     so they must not be treated as string receivers;
+ *   - interpolated double-quoted strings and heredocs with interpolation, which
+ *     the parser represents as ZEND_AST_ENCAPS_LIST and which always produce a
+ *     string (a non-interpolated "foo" is a plain ZEND_AST_ZVAL literal, already
+ *     covered above);
+ *   - to support method chaining, a `<string-receiver>-><method>()` call whose
+ *     Str method is declared to return `string` (so the call's result is itself
+ *     a string receiver).
+ * Tier 2 (declared and compile-time-resolvable string types):
+ *   - `$this->prop` where the current class declares `prop` as a plain, non-hooked,
+ *     non-static, non-virtual property typed exactly non-nullable `string`;
+ *   - a call provably returning a non-nullable `string`: `$this->m()`, `self::m()`,
+ *     `static::m()`, `parent::m()` resolved via the current/parent class, or a plain
+ *     `f()` whose literal, unambiguous name resolves to an internal or already-declared
+ *     finalized user function declared to return non-nullable `string`.
+ * The governing rule throughout: desugar ONLY when the receiver is GUARANTEED a
+ * non-nullable `string` provable at compile time from known context; otherwise fall
+ * through. Unknown `$obj->prop`/`$obj->m()`, nullable (`?string`), hooked/magic
+ * properties, and unresolvable/forward-declared callees are all rejected. */
+static bool zend_is_static_string_ast(zend_ast *ast) /* {{{ */
+{
+	if (ast->kind == ZEND_AST_ZVAL) {
+		return Z_TYPE_P(zend_ast_get_zval(ast)) == IS_STRING;
+	}
+	if (ast->kind == ZEND_AST_CAST) {
+		/* (string) and (binary) casts both carry attr == IS_STRING. */
+		return ast->attr == IS_STRING;
+	}
+	/* Concatenation always yields a string. Match the ZEND_CONCAT opcode only —
+	 * other ZEND_AST_BINARY_OP nodes (e.g. ZEND_ADD) are not strings. */
+	if (ast->kind == ZEND_AST_BINARY_OP) {
+		return ast->attr == ZEND_CONCAT;
+	}
+	/* Interpolated double-quoted strings and interpolated heredocs are encaps
+	 * lists and always evaluate to a string. */
+	if (ast->kind == ZEND_AST_ENCAPS_LIST) {
+		return true;
+	}
+	/* Tier 2: `$this->prop` declared as a non-nullable `string` typed property of
+	 * the current class. ZEND_AST_NULLSAFE_PROP is a distinct kind, so `$this?->prop`
+	 * is excluded. */
+	if (ast->kind == ZEND_AST_PROP) {
+		zend_ast *obj_ast = ast->child[0];
+		zend_ast *prop_ast = ast->child[1];
+		return is_this_fetch(obj_ast)
+			&& prop_ast->kind == ZEND_AST_ZVAL
+			&& Z_TYPE_P(zend_ast_get_zval(prop_ast)) == IS_STRING
+			&& zend_this_prop_is_nonnullable_string(Z_STR_P(zend_ast_get_zval(prop_ast)));
+	}
+	/* Tier 1 chaining: a method call on a string receiver with a literal method
+	 * name that resolves to a string-returning Str method is itself a string.
+	 * Tier 2: a `$this->m()` call resolving to a current-class method declared to
+	 * return non-nullable `string`. nullsafe (`?->`) is deliberately excluded. */
+	if (ast->kind == ZEND_AST_METHOD_CALL) {
+		zend_ast *recv_ast = ast->child[0];
+		zend_ast *method_ast = ast->child[1];
+		if (zend_is_static_string_ast(recv_ast)
+		 && method_ast->kind == ZEND_AST_ZVAL
+		 && zend_str_method_returns_string(zend_ast_get_zval(method_ast))) {
+			return true;
+		}
+		return zend_call_ast_returns_nonnullable_string(ast);
+	}
+	/* Tier 2: `self::m()` / `static::m()` / `parent::m()` resolving to a method
+	 * declared to return non-nullable `string`. */
+	if (ast->kind == ZEND_AST_STATIC_CALL) {
+		return zend_call_ast_returns_nonnullable_string(ast);
+	}
+	/* Tier 2: a plain `f()` call to an internal or already-declared user function
+	 * declared to return non-nullable `string`. */
+	if (ast->kind == ZEND_AST_CALL) {
+		return zend_call_ast_returns_nonnullable_string(ast);
+	}
+	return false;
+}
+/* }}} */
+
+/* Rewrite `<static-string>-><method>(<args>)` into `Str::<method>(<static-string>, <args>)`
+ * and compile it as a static call. Returns true if the rewrite applied. */
+static bool zend_try_compile_scalar_string_method_call(znode *result, zend_ast *ast, uint32_t type) /* {{{ */
+{
+	zend_ast *obj_ast = ast->child[0];
+	zend_ast *method_ast = ast->child[1];
+	zend_ast *args_ast = ast->child[2];
+
+	/* Only plain `->` calls with a literal method name on a static-string receiver. */
+	if (ast->kind != ZEND_AST_METHOD_CALL
+	 || !zend_is_static_string_ast(obj_ast)
+	 || method_ast->kind != ZEND_AST_ZVAL
+	 || Z_TYPE_P(zend_ast_get_zval(method_ast)) != IS_STRING) {
+		return false;
+	}
+
+	/* Build the class-name node for `Str`. ZEND_NAME_FQ resolves it as the global
+	 * `\Str` regardless of namespace. This transient AST is arena-allocated and
+	 * bulk-freed WITHOUT running zval dtors, so the name must be non-refcounted or
+	 * it leaks. Request-time interning is unreliable here (under opcache, interning
+	 * during arbitrary compilation may hand back a refcounted string), so we use a
+	 * PERMANENT interned string (persistent=1): never refcounted, never per-request
+	 * freed — leak-safe in every config including opcache. Repeated calls dedup to
+	 * the same permanent entry. */
+	zval class_zv;
+	ZVAL_STR(&class_zv, zend_string_init_interned("Str", sizeof("Str") - 1, 1));
+	zend_ast *class_ast = zend_ast_create_zval_ex(&class_zv, ZEND_NAME_FQ);
+
+	/* Build a new argument list with the receiver prepended before the original args. */
+	zend_ast_list *orig_args = zend_ast_get_list(args_ast);
+	zend_ast *new_args = zend_ast_create_arg_list(1, ZEND_AST_ARG_LIST, obj_ast);
+	for (uint32_t i = 0; i < orig_args->children; i++) {
+		new_args = zend_ast_arg_list_add(new_args, orig_args->child[i]);
+	}
+
+	zend_ast *static_call_ast = zend_ast_create(
+		ZEND_AST_STATIC_CALL, class_ast, method_ast, new_args);
+	static_call_ast->lineno = ast->lineno;
+
+	zend_compile_static_call(result, static_call_ast, type);
+	return true;
+}
+/* }}} */
+
 static void zend_compile_method_call(znode *result, zend_ast *ast, uint32_t type) /* {{{ */
 {
 	zend_ast *obj_ast = ast->child[0];
 	zend_ast *method_ast = ast->child[1];
 	zend_ast *args_ast = ast->child[2];
+
+	if (zend_try_compile_scalar_string_method_call(result, ast, type)) {
+		return;
+	}
 
 	znode obj_node, method_node;
 	zend_op *opline;
@@ -5755,7 +6146,18 @@ static void zend_compile_global_var(zend_ast *ast) /* {{{ */
 	// TODO(GLOBALS) Forbid "global $GLOBALS"?
 	if (is_this_fetch(var_ast)) {
 		zend_error_noreturn(E_COMPILE_ERROR, "Cannot use $this as global variable");
-	} else if (zend_try_compile_cv(&result, var_ast, BP_VAR_R) == SUCCESS) {
+	}
+	/* A `global $x` binding turns $x into a reference to the global, bypassing the
+	 * declared scalar type. This reference path is not enforced, so forbid it. */
+	if (name_ast->kind == ZEND_AST_ZVAL && Z_TYPE_P(zend_ast_get_zval(name_ast)) == IS_STRING) {
+		zend_property_info *info = zend_find_typed_local(Z_STR_P(zend_ast_get_zval(name_ast)));
+		if (info) {
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Cannot use typed local variable $%s as global variable",
+				ZSTR_VAL(info->name));
+		}
+	}
+	if (zend_try_compile_cv(&result, var_ast, BP_VAR_R) == SUCCESS) {
 		zend_op *opline = zend_emit_op(NULL, ZEND_BIND_GLOBAL, &result, &name_node);
 		opline->extended_value = zend_alloc_cache_slot();
 	} else {
@@ -5807,6 +6209,13 @@ static void zend_compile_static_var(zend_ast *ast) /* {{{ */
 
 	if (zend_string_equals(var_name, ZSTR_KNOWN(ZEND_STR_THIS))) {
 		zend_error_noreturn(E_COMPILE_ERROR, "Cannot use $this as static variable");
+	}
+
+	/* A `static $x` binding turns $x into a reference to the static slot, bypassing the
+	 * declared scalar type. This reference path is not enforced, so forbid it. */
+	if (zend_find_typed_local(var_name)) {
+		zend_error_noreturn(E_COMPILE_ERROR,
+			"Cannot use typed local variable $%s as static variable", ZSTR_VAL(var_name));
 	}
 
 	if (!CG(active_op_array)->static_variables) {
@@ -6422,6 +6831,20 @@ static void zend_compile_foreach(zend_ast *ast) /* {{{ */
 
 	if (value_ast->kind == ZEND_AST_ARRAY && zend_propagate_list_refs(value_ast)) {
 		by_ref = true;
+	}
+
+	/* `foreach ($arr as &$x)` makes the typed local $x a reference into the array
+	 * element, bypassing its declared scalar type. This reference path is not
+	 * enforced, so forbid it. */
+	if (by_ref && value_ast->kind == ZEND_AST_VAR
+	 && value_ast->child[0]->kind == ZEND_AST_ZVAL
+	 && Z_TYPE_P(zend_ast_get_zval(value_ast->child[0])) == IS_STRING) {
+		zend_property_info *info = zend_find_typed_local(Z_STR_P(zend_ast_get_zval(value_ast->child[0])));
+		if (info) {
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Cannot use typed local variable $%s as foreach by-reference value",
+				ZSTR_VAL(info->name));
+		}
 	}
 
 	if (by_ref && is_variable) {
@@ -10743,8 +11166,15 @@ static void zend_compile_post_incdec(znode *result, const zend_ast *ast) /* {{{ 
 		if (opline && opline->opcode == ZEND_FETCH_DIM_RW) {
 			opline->extended_value = ZEND_FETCH_DIM_INCDEC;
 		}
-		zend_emit_op_tmp(result, ast->kind == ZEND_AST_POST_INC ? ZEND_POST_INC : ZEND_POST_DEC,
-			&var_node, NULL);
+		/* Typed local CV: emit the type-enforcing variant (see ZEND_PRE_INC_TYPED). */
+		uint8_t opcode;
+		if (var_node.op_type == IS_CV && CG(active_op_array)->cv_types
+		 && CG(active_op_array)->cv_types[EX_VAR_TO_NUM(var_node.u.op.var)]) {
+			opcode = ast->kind == ZEND_AST_POST_INC ? ZEND_POST_INC_TYPED : ZEND_POST_DEC_TYPED;
+		} else {
+			opcode = ast->kind == ZEND_AST_POST_INC ? ZEND_POST_INC : ZEND_POST_DEC;
+		}
+		zend_emit_op_tmp(result, opcode, &var_node, NULL);
 	}
 }
 /* }}} */
@@ -10772,8 +11202,15 @@ static void zend_compile_pre_incdec(znode *result, const zend_ast *ast) /* {{{ *
 		if (opline && opline->opcode == ZEND_FETCH_DIM_RW) {
 			opline->extended_value = ZEND_FETCH_DIM_INCDEC;
 		}
-		zend_emit_op_tmp(result, ast->kind == ZEND_AST_PRE_INC ? ZEND_PRE_INC : ZEND_PRE_DEC,
-			&var_node, NULL);
+		/* Typed local CV: emit the type-enforcing variant (see ZEND_PRE_INC_TYPED). */
+		uint8_t opcode;
+		if (var_node.op_type == IS_CV && CG(active_op_array)->cv_types
+		 && CG(active_op_array)->cv_types[EX_VAR_TO_NUM(var_node.u.op.var)]) {
+			opcode = ast->kind == ZEND_AST_PRE_INC ? ZEND_PRE_INC_TYPED : ZEND_PRE_DEC_TYPED;
+		} else {
+			opcode = ast->kind == ZEND_AST_PRE_INC ? ZEND_PRE_INC : ZEND_PRE_DEC;
+		}
+		zend_emit_op_tmp(result, opcode, &var_node, NULL);
 	}
 }
 /* }}} */
