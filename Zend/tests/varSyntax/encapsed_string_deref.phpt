@@ -24,6 +24,6 @@ string(1) "f"
 
 Warning: Attempt to read property "prop" on string in %s on line %d
 NULL
-Call to a member function method() on string
+Call to undefined method Str::method()
 int(42)
 int(42)
