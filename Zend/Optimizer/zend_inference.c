@@ -3085,6 +3085,37 @@ static zend_always_inline zend_result _zend_update_type_info(
 				UPDATE_SSA_TYPE(tmp, ssa_op->result_def);
 			}
 			break;
+		case ZEND_ASSIGN_TYPED:
+		case ZEND_ASSIGN_OP_TYPED:
+		case ZEND_PRE_INC_TYPED:
+		case ZEND_PRE_DEC_TYPED:
+		case ZEND_POST_INC_TYPED:
+		case ZEND_POST_DEC_TYPED:
+		{
+			/* Writes into a typed local CV (op1). The VM coerces/verifies the
+			 * stored value against the local's declared scalar type, so after the
+			 * op the CV provably holds exactly that declared type (a TypeError on
+			 * failure is handled via the exception edge). Model both op1_def and,
+			 * for the forms that produce one, result_def with the declared mask;
+			 * zend_fetch_prop_type() turns the declared zend_type into the value
+			 * mask (nullable -> MAY_BE_NULL, string/array/object -> RC bits) and
+			 * falls back to the permissive engine mask when no info is available. */
+			const zend_property_info *info = op_array->cv_types
+				? op_array->cv_types[EX_VAR_TO_NUM(opline->op1.var)] : NULL;
+			tmp = zend_fetch_prop_type(script, info, NULL);
+			if (ssa_op->op1_def >= 0) {
+				uint32_t t = tmp;
+				if (t1 & MAY_BE_REF) {
+					/* The typed local may be aliased by a typed reference. */
+					t |= MAY_BE_REF;
+				}
+				UPDATE_SSA_TYPE(t, ssa_op->op1_def);
+			}
+			if (ssa_op->result_def >= 0) {
+				UPDATE_SSA_TYPE(tmp & ~MAY_BE_REF, ssa_op->result_def);
+			}
+			break;
+		}
 		case ZEND_ASSIGN:
 			if (ssa_op->op2_def >= 0) {
 				tmp = t2;
@@ -5130,6 +5161,14 @@ ZEND_API bool zend_may_throw_ex(const zend_op *opline, const zend_ssa_op *ssa_op
 				return 0;
 			}
 			return (t1 & (MAY_BE_OBJECT|MAY_BE_ARRAY_OF_ARRAY|MAY_BE_ARRAY_OF_OBJECT)) || (t2 & (MAY_BE_OBJECT|MAY_BE_ARRAY_OF_ARRAY|MAY_BE_ARRAY_OF_OBJECT));
+		case ZEND_ASSIGN_TYPED:
+		case ZEND_ASSIGN_OP_TYPED:
+		case ZEND_PRE_INC_TYPED:
+		case ZEND_PRE_DEC_TYPED:
+		case ZEND_POST_INC_TYPED:
+		case ZEND_POST_DEC_TYPED:
+			/* Coercion or int-overflow against the declared type may TypeError. */
+			return 1;
 		case ZEND_ASSIGN_OP:
 			if (opline->extended_value == ZEND_ADD) {
 				if ((t1 & MAY_BE_ANY) == MAY_BE_ARRAY

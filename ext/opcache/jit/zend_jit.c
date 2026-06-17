@@ -2101,6 +2101,11 @@ static int zend_jit(const zend_op_array *op_array, zend_ssa *ssa, const zend_op 
 							/* Named parameters not supported in JIT (yet) */
 							break;
 						}
+						if (zend_jit_op1_is_typed_cv(opline, op_array)) {
+							/* Typed local: let the VM handler create the reference so the
+							 * local's type source is attached (inline codegen would not). */
+							break;
+						}
 						if (!zend_jit_send_ref(&ctx, opline, op_array,
 								OP1_INFO(), 0)) {
 							goto jit_failure;
@@ -2118,6 +2123,14 @@ static int zend_jit(const zend_op_array *op_array, zend_ssa *ssa, const zend_op 
 						if ((opline->opcode == ZEND_SEND_VAR_EX
 						  || opline->opcode == ZEND_SEND_VAR_NO_REF_EX)
 						 && opline->op2.num > MAX_ARG_FLAG_NUM) {
+							break;
+						}
+						if ((opline->opcode == ZEND_SEND_VAR_EX
+						  || opline->opcode == ZEND_SEND_VAR_NO_REF_EX
+						  || opline->opcode == ZEND_SEND_FUNC_ARG)
+						 && zend_jit_op1_is_typed_cv(opline, op_array)) {
+							/* Typed local possibly sent by reference: let the VM handler
+							 * create the reference so the local's type source is attached. */
 							break;
 						}
 						op1_addr = OP1_REG_ADDR();
@@ -2884,7 +2897,8 @@ static int zend_jit(const zend_op_array *op_array, zend_ssa *ssa, const zend_op 
 					break;
 				default:
 					if (!zend_jit_handler(&ctx, opline,
-							zend_may_throw(opline, ssa_op, op_array, ssa))) {
+							zend_may_throw(opline, ssa_op, op_array, ssa)
+							|| zend_jit_ref_op_may_throw_uninit_typed_cv(opline, op_array))) {
 						goto jit_failure;
 					}
 					if (i == end
@@ -2907,8 +2921,11 @@ done:
 		zend_jit_common_return(jit);
 
 		bool left_frame = false;
-		if (op_array->last_var > 100) {
-			/* To many CVs to unroll */
+		if (op_array->last_var > 100 || op_array->cv_types != NULL) {
+			/* Too many CVs to unroll, or typed locals are present: the unrolled
+			 * per-CV free does not remove a typed local's type source from a
+			 * reference it was aliased into, so use zend_free_compiled_variables()
+			 * (which does, balancing the add at ref-creation time). */
 			if (!zend_jit_free_cvs(&ctx)) {
 				goto jit_failure;
 			}
