@@ -101,6 +101,7 @@ static zend_op *zend_delayed_compile_var(znode *result, zend_ast *ast, uint32_t 
 static void zend_compile_expr(znode *result, zend_ast *ast);
 static void zend_compile_stmt(zend_ast *ast);
 static void zend_compile_assign(znode *result, zend_ast *ast, bool stmt, uint32_t type);
+static void zend_compile_static_call(znode *result, zend_ast *ast, uint32_t type);
 
 #ifdef ZEND_CHECK_STACK_LIMIT
 zend_never_inline static void zend_stack_limit_error(void)
@@ -5481,11 +5482,407 @@ static void zend_compile_call(znode *result, const zend_ast *ast, uint32_t type)
 }
 /* }}} */
 
+static uint8_t zend_get_static_scalar_ast_type(zend_ast *ast);
+
+/* True if `type` is a declared, non-nullable scalar type whose pure mask is exactly
+ * `MAY_BE_<scalar_type>` and nothing else — i.e. exactly `string` or exactly `int` and
+ * nothing more: not `?string`/`int|null`, not a union such as `string|int` or `int|float`,
+ * not `mixed`, not a class/intersection type. `scalar_type` is an IS_* kind whose mask bit
+ * is (1 << scalar_type), i.e. IS_STRING or IS_LONG here. The pure-mask equality already
+ * rejects nullable (the nullable bit lives inside the mask and equals MAY_BE_NULL), and the
+ * complex check rejects any class-name/list component. This is the property we need to
+ * *prove* a value is a guaranteed non-nullable scalar of a single concrete type at compile
+ * time. Note that `int|float` (e.g. the return of Int::pow) is a two-bit union and is
+ * therefore rejected for every single `scalar_type` — exactly what makes such a result
+ * non-chainable. */
+static bool zend_type_is_nonnullable_scalar(zend_type type, uint8_t scalar_type) /* {{{ */
+{
+	return ZEND_TYPE_IS_SET(type)
+		&& !ZEND_TYPE_IS_COMPLEX(type)
+		&& ZEND_TYPE_PURE_MASK(type) == (1u << scalar_type);
+}
+/* }}} */
+
+/* True if the function/method has a *declared* return type guaranteed to be the exact
+ * non-nullable scalar `scalar_type` (see zend_type_is_nonnullable_scalar). Used both by the
+ * string-returning-call resolution (string chaining / Tier 2 callee returns) and by the int
+ * chaining check: a backing-class method is a chainable guaranteed-scalar receiver only when
+ * its declared return type is exactly that scalar — Str::trim/upper/lower (:string) and
+ * Int::abs (:int) qualify, while Str::length (:int) and Int::pow (:int|float) do not. A
+ * function with no declared return type is rejected: we cannot prove what it returns. */
+static bool zend_fn_returns_nonnullable_scalar(const zend_function *fbc, uint8_t scalar_type) /* {{{ */
+{
+	if (!(fbc->common.fn_flags & ZEND_ACC_HAS_RETURN_TYPE)) {
+		return false;
+	}
+	const zend_arg_info *return_info = fbc->common.arg_info - 1;
+	return zend_type_is_nonnullable_scalar(return_info->type, scalar_type);
+}
+/* }}} */
+
+/* True if the backing class named (class_name, class_name_len) declares `<method_name>`
+ * with a return type that is exactly the non-nullable scalar `scalar_type`. Used to decide
+ * whether a `<static-scalar>-><method>()` call may itself act as a static scalar receiver
+ * of that same type for chaining (e.g. `"..."->trim()->upper()` for string, or an
+ * int-returning Int method for int).
+ *
+ * This is real return-type introspection: the backing class is an internal class registered
+ * at MINIT under an internal-only NUL-prefixed name (ZEND_STR_SCALAR_METHODS_CLASS_NAME /
+ * ZEND_STR_SCALAR_METHODS_INT_CLASS_NAME), so it is always present in the class table during
+ * compilation, and zend_lookup_class() does not autoload while compiling (it returns NULL
+ * instead). Methods whose return type is not exactly `scalar_type` are rejected: Str::length()
+ * (:int) is not a chainable string receiver, and Int::pow() (:int|float) is not a chainable
+ * int receiver, while Int::abs() (:int) is. */
+static bool zend_scalar_method_returns_scalar(
+		zval *method_name, const char *class_name, size_t class_name_len, uint8_t scalar_type) /* {{{ */
+{
+	if (Z_TYPE_P(method_name) != IS_STRING) {
+		return false;
+	}
+
+	zend_string *cname = zend_string_init(class_name, class_name_len, 0);
+	zend_class_entry *ce = zend_lookup_class(cname);
+	zend_string_release(cname);
+	if (!ce) {
+		return false;
+	}
+
+	zend_string *lcname = zend_string_tolower(Z_STR_P(method_name));
+	const zend_function *fbc = zend_hash_find_ptr(&ce->function_table, lcname);
+	zend_string_release(lcname);
+	if (!fbc) {
+		return false;
+	}
+
+	return zend_fn_returns_nonnullable_scalar(fbc, scalar_type);
+}
+/* }}} */
+
+/* Tier 2 receiver: `$this->prop` where the *current* class declares `prop` as a
+ * plain, non-hooked, non-static, non-virtual property typed exactly non-nullable
+ * `scalar_type` (IS_STRING or IS_LONG). Declared typed properties bypass __get, so
+ * reading such a property is guaranteed to yield that scalar (a typed property that is
+ * never assigned throws on read rather than yielding the wrong type, which is fine —
+ * desugaring or not, the access errors). We resolve the property_info from the current
+ * class's properties_info table at compile time. Hooked (8.4 hooks), virtual, magic,
+ * static, or wrong-typed properties are rejected, as is any access when the scope isn't
+ * statically known (closures rebindable; traits resolve `self` to the using class).
+ * The key into properties_info is the *unmangled* property name. */
+static bool zend_this_prop_is_nonnullable_scalar(zend_string *prop_name, uint8_t scalar_type) /* {{{ */
+{
+	zend_class_entry *ce = CG(active_class_entry);
+	if (!ce || !zend_is_scope_known()) {
+		return false;
+	}
+
+	const zend_property_info *info = zend_hash_find_ptr(&ce->properties_info, prop_name);
+	if (!info) {
+		return false;
+	}
+
+	/* Only a plain instance property with backing storage and no hooks bypasses
+	 * __get and is a guaranteed direct read. */
+	if ((info->flags & (ZEND_ACC_STATIC | ZEND_ACC_VIRTUAL)) || info->hooks != NULL) {
+		return false;
+	}
+
+	return zend_type_is_nonnullable_scalar(info->type, scalar_type);
+}
+/* }}} */
+
+/* Tier 2 receiver helper: resolve a `self::`/`static::`/`parent::` static-call class
+ * keyword to its compile-time class entry, or NULL if not resolvable now. `self` and
+ * `static` resolve to the current class (for `static`, late static binding may pick
+ * an overriding method in a subclass, but PHP return-type variance forbids widening a
+ * `: string` return, so any override still returns a non-nullable string — the return
+ * type is therefore safe regardless of which method runs). `parent` resolves only when
+ * the current class is already linked; otherwise ce->parent is still a name string and
+ * must not be dereferenced, so we fall through. Requires a statically known scope. */
+/* Tier 2 receiver: a plain function call `f(...)` whose result is *provably* a non-nullable
+ * scalar of exactly `scalar_type` (IS_STRING or IS_LONG), resolvable at compile time — a literal,
+ * unambiguous name resolving to an internal function (always available) or to an already-declared,
+ * finalized user function present in CG(function_table) at this compile point. Functions cannot be
+ * redeclared and namespace-relative names needing runtime fallback are rejected, so the resolved
+ * callee is the runtime callee. Method-call results ($this->m(), self::/static::/parent::m()) are
+ * deliberately NOT receivers: their soundness would rest on return-type covariance under
+ * inheritance/LSB, an attack surface not worth the marginal value, and they would be $this-only
+ * (inconsistent with $obj->m()). A $this typed-property read ($this->prop) is still a receiver via
+ * its own path. nullsafe (`?->`) is excluded. */
+static bool zend_call_ast_returns_nonnullable_scalar(zend_ast *ast, uint8_t scalar_type) /* {{{ */
+{
+	if (ast->kind == ZEND_AST_CALL) {
+		/* Plain `f(...)` with a literal function name. Resolve ONLY when the name is
+		 * unambiguous (not a namespace-relative name that needs runtime global
+		 * fallback) and the callee is already present in the function table now:
+		 * an internal function (always registered) or a finalized user function
+		 * (one whose declaration has completed pass two). A not-yet-declared or
+		 * conditionally-declared user function is not resolvable here and falls
+		 * through — this is the documented declaration-order limitation. */
+		zend_ast *name_ast = ast->child[0];
+		if (name_ast->kind != ZEND_AST_ZVAL || Z_TYPE_P(zend_ast_get_zval(name_ast)) != IS_STRING) {
+			return false;
+		}
+
+		znode name_node;
+		bool runtime_resolution = zend_compile_function_name(&name_node, name_ast);
+		/* zend_compile_function_name resolves into a refcounted string we own here;
+		 * we are only probing, not emitting, so we must release it. */
+		if (runtime_resolution) {
+			zval_ptr_dtor(&name_node.u.constant);
+			return false;
+		}
+
+		zend_string *lcname = zend_string_tolower(Z_STR(name_node.u.constant));
+		zval_ptr_dtor(&name_node.u.constant);
+		const zend_function *fbc = zend_hash_find_ptr(CG(function_table), lcname);
+		zend_string_release(lcname);
+		if (!fbc || !fbc_is_finalized(fbc)) {
+			return false;
+		}
+		return zend_fn_returns_nonnullable_scalar(fbc, scalar_type);
+	}
+
+	return false;
+}
+/* }}} */
+
+/* Determine the GUARANTEED scalar type of an expression for the purpose of dispatching
+ * scalar methods to a backing class. Returns the IS_* kind of the receiver's proven type
+ * — IS_STRING (dispatch to Str) or IS_LONG (dispatch to Int) — or 0 when the receiver is
+ * not provably a single concrete scalar type at compile time (no desugar; normal method
+ * call). This is the generalization of the original string-only predicate: the same
+ * syntactic/declared "guaranteed type" forms, now answering *which* scalar type.
+ *
+ * STRING (dispatch to Str). Always a guaranteed string:
+ *   - string literals (ZEND_AST_ZVAL holding an IS_STRING zval);
+ *   - explicit (string) casts — and (binary) casts, which the scanner maps to the same
+ *     T_STRING_CAST token, so both are ZEND_AST_CAST with attr IS_STRING;
+ *   - string concatenation (`a . b`), a ZEND_AST_BINARY_OP whose opcode (in ->attr) is
+ *     ZEND_CONCAT. Concat always yields a string regardless of operand types. We match
+ *     ZEND_CONCAT *specifically*: arithmetic/bitwise binary ops (ZEND_ADD, ZEND_SUB, ...)
+ *     share the kind but do NOT produce strings — and, importantly, are NOT treated as a
+ *     guaranteed int either, since they are optimizer-inferred rather than declared;
+ *   - interpolated double-quoted strings and heredocs (ZEND_AST_ENCAPS_LIST).
+ *
+ * INT (dispatch to Int). Guaranteed int (the syntactic/declared forms only — NEVER an
+ * optimizer-inferred arithmetic result such as `$a + $b`):
+ *   - int literals (ZEND_AST_ZVAL holding an IS_LONG zval);
+ *   - explicit (int) casts (ZEND_AST_CAST with attr IS_LONG).
+ *
+ * Common to both scalar types:
+ *   - chaining: a `<scalar-receiver>-><method>()` call whose backing-class method is
+ *     declared to return that same exact non-nullable scalar (so the result is itself a
+ *     receiver of that type). Str::trim/upper/lower (:string) chain as string; Int::abs
+ *     (:int) chains as int; Str::length (:int) and Int::pow (:int|float) do NOT chain;
+ *   - `$this->prop` typed exactly non-nullable `string`/`int` (Tier 2);
+ *   - a call provably returning a non-nullable `string`/`int`: `$this->m()`, `self::m()`,
+ *     `static::m()`, `parent::m()`, or a plain `f()` to an internal/finalized user
+ *     function with that declared return type (Tier 2).
+ *
+ * The governing rule throughout: desugar ONLY when the receiver is GUARANTEED a single
+ * non-nullable scalar provable at compile time from known/declared context; otherwise
+ * return 0. Unknown `$obj->prop`/`$obj->m()`, nullable types, hooked/magic properties,
+ * unresolvable/forward-declared callees, float/bool receivers, and optimizer-inferred
+ * arithmetic are all rejected. */
+static uint8_t zend_get_static_scalar_ast_type(zend_ast *ast) /* {{{ */
+{
+	if (ast->kind == ZEND_AST_ZVAL) {
+		uint8_t t = Z_TYPE_P(zend_ast_get_zval(ast));
+		return (t == IS_STRING || t == IS_LONG) ? t : 0;
+	}
+	if (ast->kind == ZEND_AST_CAST) {
+		/* (string)/(binary) casts carry attr == IS_STRING; (int) casts attr == IS_LONG.
+		 * Other casts ((float)/(bool)/(array)/(object)) are not added this pass. */
+		if (ast->attr == IS_STRING) {
+			return IS_STRING;
+		}
+		if (ast->attr == IS_LONG) {
+			return IS_LONG;
+		}
+		return 0;
+	}
+	/* Concatenation always yields a string. Match the ZEND_CONCAT opcode only —
+	 * other ZEND_AST_BINARY_OP nodes (e.g. ZEND_ADD) are neither a guaranteed string
+	 * nor a guaranteed int (they are optimizer-inferred, not declared). */
+	if (ast->kind == ZEND_AST_BINARY_OP) {
+		return ast->attr == ZEND_CONCAT ? IS_STRING : 0;
+	}
+	/* Unary minus/plus over an integer *literal* is a guaranteed int: this is how negative int
+	 * literals are written at all (`-5` parses as ZEND_AST_UNARY_MINUS over the int literal `5`),
+	 * so it is literal notation, not arithmetic. The operand is restricted to a literal on purpose:
+	 * an int literal is in [0, ZEND_LONG_MAX] (the magnitude `9223372036854775808` already lexes
+	 * as a float), so negating it always yields a valid int. Over a *non-literal* int operand
+	 * (`-(int)$x`, `-$typedInt`) the result is `int|float`, because `-PHP_INT_MIN` overflows to a
+	 * float at runtime — and an `int|float` is not a guaranteed single scalar (exactly why a method
+	 * returning `int|float`, e.g. pow(), is a terminal). Such forms fall through, not desugar. */
+	if (ast->kind == ZEND_AST_UNARY_MINUS || ast->kind == ZEND_AST_UNARY_PLUS) {
+		zend_ast *operand = ast->child[0];
+		if (operand->kind == ZEND_AST_ZVAL && Z_TYPE_P(zend_ast_get_zval(operand)) == IS_LONG) {
+			return IS_LONG;
+		}
+		return 0;
+	}
+	/* Interpolated double-quoted strings and interpolated heredocs are encaps
+	 * lists and always evaluate to a string. */
+	if (ast->kind == ZEND_AST_ENCAPS_LIST) {
+		return IS_STRING;
+	}
+	/* Tier 2: `$this->prop` declared as a non-nullable `string`/`int` typed property of
+	 * the current class. ZEND_AST_NULLSAFE_PROP is a distinct kind, so `$this?->prop`
+	 * is excluded. */
+	if (ast->kind == ZEND_AST_PROP) {
+		zend_ast *obj_ast = ast->child[0];
+		zend_ast *prop_ast = ast->child[1];
+		if (is_this_fetch(obj_ast)
+		 && prop_ast->kind == ZEND_AST_ZVAL
+		 && Z_TYPE_P(zend_ast_get_zval(prop_ast)) == IS_STRING) {
+			zend_string *prop_name = Z_STR_P(zend_ast_get_zval(prop_ast));
+			if (zend_this_prop_is_nonnullable_scalar(prop_name, IS_STRING)) {
+				return IS_STRING;
+			}
+			if (zend_this_prop_is_nonnullable_scalar(prop_name, IS_LONG)) {
+				return IS_LONG;
+			}
+		}
+		return 0;
+	}
+	/* Tier 1 chaining: a method call on a guaranteed-scalar receiver with a literal method
+	 * name resolving to a backing-class method declared to return a non-nullable scalar is
+	 * itself a guaranteed scalar of that *return* type. The backing class is selected by the
+	 * receiver's guaranteed type (string→Str, int→Int); the result type is whatever scalar the
+	 * method is declared to return, which need not equal the receiver type — e.g.
+	 * `"..."->length()` yields a guaranteed int and so chains into int methods
+	 * (`"..."->length()->pow(2)`). Tier 2: a `$this->m()`/`self::m()`/... call resolving to a
+	 * method declared to return non-nullable `string`/`int`. nullsafe (`?->`) is excluded. */
+	if (ast->kind == ZEND_AST_METHOD_CALL) {
+		zend_ast *recv_ast = ast->child[0];
+		zend_ast *method_ast = ast->child[1];
+		uint8_t recv_type = zend_get_static_scalar_ast_type(recv_ast);
+		if (recv_type != 0 && method_ast->kind == ZEND_AST_ZVAL) {
+			zval *method_name = zend_ast_get_zval(method_ast);
+			const char *backing_name;
+			size_t backing_name_len;
+			if (recv_type == IS_STRING) {
+				backing_name = ZEND_STR_SCALAR_METHODS_CLASS_NAME;
+				backing_name_len = ZEND_STR_SCALAR_METHODS_CLASS_NAME_LEN;
+			} else { /* recv_type == IS_LONG (the only other value this returns) */
+				backing_name = ZEND_STR_SCALAR_METHODS_INT_CLASS_NAME;
+				backing_name_len = ZEND_STR_SCALAR_METHODS_INT_CLASS_NAME_LEN;
+			}
+			if (zend_scalar_method_returns_scalar(method_name, backing_name, backing_name_len, IS_STRING)) {
+				return IS_STRING;
+			}
+			if (zend_scalar_method_returns_scalar(method_name, backing_name, backing_name_len, IS_LONG)) {
+				return IS_LONG;
+			}
+		}
+		if (zend_call_ast_returns_nonnullable_scalar(ast, IS_STRING)) {
+			return IS_STRING;
+		}
+		if (zend_call_ast_returns_nonnullable_scalar(ast, IS_LONG)) {
+			return IS_LONG;
+		}
+		return 0;
+	}
+	/* Tier 2: `self::m()` / `static::m()` / `parent::m()`, or a plain `f()` to an internal
+	 * or already-declared finalized user function, resolving to a method/function declared
+	 * to return non-nullable `string`/`int`. */
+	if (ast->kind == ZEND_AST_STATIC_CALL || ast->kind == ZEND_AST_CALL) {
+		if (zend_call_ast_returns_nonnullable_scalar(ast, IS_STRING)) {
+			return IS_STRING;
+		}
+		if (zend_call_ast_returns_nonnullable_scalar(ast, IS_LONG)) {
+			return IS_LONG;
+		}
+		return 0;
+	}
+	return 0;
+}
+/* }}} */
+
+/* Rewrite `<static-scalar>-><method>(<args>)` into `<Backing>::<method>(<static-scalar>, <args>)`
+ * and compile it as a static call, where <Backing> is chosen by the receiver's GUARANTEED
+ * scalar type: a guaranteed string dispatches to Str, a guaranteed int to Int. Returns true
+ * if the rewrite applied, false to fall through to a normal method call. */
+static bool zend_try_compile_scalar_method_call(znode *result, zend_ast *ast, uint32_t type) /* {{{ */
+{
+	zend_ast *obj_ast = ast->child[0];
+	zend_ast *method_ast = ast->child[1];
+	zend_ast *args_ast = ast->child[2];
+
+	/* Only plain `->` calls with a literal method name on a guaranteed-scalar receiver. */
+	if (ast->kind != ZEND_AST_METHOD_CALL
+	 || method_ast->kind != ZEND_AST_ZVAL
+	 || Z_TYPE_P(zend_ast_get_zval(method_ast)) != IS_STRING) {
+		return false;
+	}
+
+	uint8_t scalar_type = zend_get_static_scalar_ast_type(obj_ast);
+	const char *backing_name;
+	size_t backing_name_len;
+	switch (scalar_type) {
+		case IS_STRING:
+			backing_name = ZEND_STR_SCALAR_METHODS_CLASS_NAME;
+			backing_name_len = ZEND_STR_SCALAR_METHODS_CLASS_NAME_LEN;
+			break;
+		case IS_LONG:
+			backing_name = ZEND_STR_SCALAR_METHODS_INT_CLASS_NAME;
+			backing_name_len = ZEND_STR_SCALAR_METHODS_INT_CLASS_NAME_LEN;
+			break;
+		default:
+			/* Not a guaranteed single scalar receiver — normal method call. */
+			return false;
+	}
+
+	/* Build the class-name node for the internal backing class. Its name begins with a NUL
+	 * byte (ZEND_STR_SCALAR_METHODS_CLASS_NAME / ..._INT_CLASS_NAME) so it is userland-
+	 * unrepresentable and cannot collide with or be resolved as any userland `Str`/`Int`.
+	 * ZEND_NAME_FQ resolves it verbatim regardless of namespace (the leading byte is NUL, not
+	 * '\\', so no prefix is stripped and no namespace is prepended). The call is then compiled
+	 * exactly like a normal static call: the name is stored as a class-name literal and resolved
+	 * at runtime through the static-call cache slot — never a baked CE pointer — so it persists
+	 * and relocates correctly under opcache SHM and file_cache.
+	 *
+	 * This transient AST is arena-allocated and bulk-freed WITHOUT running zval dtors, so the
+	 * name must be non-refcounted or it leaks. Request-time interning is unreliable here (under
+	 * opcache, interning during arbitrary compilation may hand back a refcounted string), so we
+	 * use a PERMANENT interned string (persistent=1): never refcounted, never per-request freed
+	 * — leak-safe in every config including opcache. Repeated calls dedup to the same permanent
+	 * entry. */
+	zval class_zv;
+	ZVAL_STR(&class_zv, zend_string_init_interned(backing_name, backing_name_len, 1));
+	zend_ast *class_ast = zend_ast_create_zval_ex(&class_zv, ZEND_NAME_FQ);
+
+	/* Build a new argument list with the receiver prepended before the original args. */
+	zend_ast_list *orig_args = zend_ast_get_list(args_ast);
+	zend_ast *new_args = zend_ast_create_arg_list(1, ZEND_AST_ARG_LIST, obj_ast);
+	for (uint32_t i = 0; i < orig_args->children; i++) {
+		new_args = zend_ast_arg_list_add(new_args, orig_args->child[i]);
+	}
+
+	zend_ast *static_call_ast = zend_ast_create(
+		ZEND_AST_STATIC_CALL, class_ast, method_ast, new_args);
+	static_call_ast->lineno = ast->lineno;
+
+	zend_compile_static_call(result, static_call_ast, type);
+	return true;
+}
+/* }}} */
+
 static void zend_compile_method_call(znode *result, zend_ast *ast, uint32_t type) /* {{{ */
 {
 	zend_ast *obj_ast = ast->child[0];
 	zend_ast *method_ast = ast->child[1];
 	zend_ast *args_ast = ast->child[2];
+
+	/* Scalar object methods: if the receiver is a compile-time-guaranteed scalar
+	 * (string/int literal, cast, concat, interpolation, $this typed prop, or a call
+	 * with a non-nullable scalar return type), rewrite `<recv>->m(args)` into a static
+	 * call on the internal Str/Int backing class. Object/null/unknown receivers fall
+	 * through to the normal method-call path below, byte-for-byte unchanged. */
+	if (zend_try_compile_scalar_method_call(result, ast, type)) {
+		return;
+	}
 
 	znode obj_node, method_node;
 	zend_op *opline;
