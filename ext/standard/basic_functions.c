@@ -114,6 +114,13 @@ PHPAPI php_basic_globals basic_globals;
 #include "zend_frameless_function.h"
 #include "basic_functions_arginfo.h"
 
+/* Scalar-method backing-class submodules (str.c, int.c): their MINITs register the
+ * internal Str/Int classes. Declared here for BASIC_MINIT_SUBMODULE() below, mirroring
+ * how the other ext/standard submodules are prototyped via their php_*.h headers.
+ * (The *_arginfo.h headers are included by str.c/int.c themselves, not here.) */
+PHP_MINIT_FUNCTION(str);
+PHP_MINIT_FUNCTION(int);
+
 #if __has_feature(memory_sanitizer)
 # include <sanitizer/msan_interface.h>
 #endif
@@ -297,6 +304,8 @@ PHP_MINIT_FUNCTION(basic) /* {{{ */
 	rounding_mode_ce = register_class_RoundingMode();
 	sort_direction_ce = register_class_SortDirection();
 
+	BASIC_MINIT_SUBMODULE(str)
+	BASIC_MINIT_SUBMODULE(int)
 	BASIC_MINIT_SUBMODULE(var)
 	BASIC_MINIT_SUBMODULE(file)
 	BASIC_MINIT_SUBMODULE(browscap)
