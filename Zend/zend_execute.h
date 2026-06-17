@@ -615,6 +615,311 @@ ZEND_API bool zend_verify_property_type(const zend_property_info *info, zval *pr
 		} \
 	} while (0)
 
+/* Add `type` as a type source on `ref` unless it is already present. Keeps the per-CV-slot
+ * ADD/DEL bookkeeping balanced when the same slot is promoted more than once (already a
+ * reference from `&$cv`, restored from the symbol table on re-attach, or promoted by an
+ * earlier by-name write/materialization). */
+static zend_always_inline void zend_ref_add_type_source_dedup(zend_reference *ref, zend_property_info *type)
+{
+	zend_property_info *p;
+	bool found = false;
+	ZEND_REF_FOREACH_TYPE_SOURCES(ref, p) {
+		if (p == type) {
+			found = true;
+			break;
+		}
+	} ZEND_REF_FOREACH_TYPE_SOURCES_END();
+	if (!found) {
+		ZEND_REF_ADD_TYPE_SOURCE(ref, type);
+	}
+}
+
+/* When a function's CV slots are exposed by name through a symbol table (each as an
+ * IS_INDIRECT entry), a by-name dynamic write (`$$name = ...`, extract(), parse_str(), ...)
+ * follows the indirection straight into the CV slot. A plain value slot would take the write
+ * as an unchecked copy, bypassing a typed local's declared type. Promoting the slot to a
+ * reference and attaching the local's synthesized type as a source routes every such write
+ * through the existing typed-reference enforcement (_ZEND_TRY_ASSIGN_VALUE_EX, ZEND_ASSIGN on
+ * IS_REFERENCE).
+ *
+ * Caller guarantees `type != NULL` (the CV is typed). Only DEFINED slots are promoted, so a
+ * declared-but-unassigned typed local keeps its UNDEF state and isset()/get_defined_vars() are
+ * unaffected. The type source is added at most once per slot: if the slot is already a
+ * reference (aliased earlier by `&$cv`, restored from the symbol table on re-attach, or
+ * promoted by an earlier call) the source is added only when not already present, so the single
+ * per-CV-slot removal at frame teardown (i_free_compiled_variables() /
+ * zend_detach_symbol_table()) stays balanced. */
+static zend_always_inline void zend_promote_cv_to_typed_ref(zval *var, zend_property_info *type)
+{
+	if (Z_TYPE_P(var) == IS_UNDEF) {
+		return;
+	}
+	if (!Z_ISREF_P(var)) {
+		ZVAL_MAKE_REF_EX(var, 1);
+		ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(var), type);
+	} else {
+		zend_ref_add_type_source_dedup(Z_REF_P(var), type);
+	}
+}
+
+/* Promote every typed CV of a frame that currently holds a value to a typed reference (see
+ * zend_promote_cv_to_typed_ref). Called wherever a frame's symbol table is handed out for a
+ * by-name access (zend_rebuild_symbol_table, zend_attach_symbol_table, and the dynamic
+ * variable fetch path), so by-name writes through the IS_INDIRECT entries are type-checked.
+ * Cheap no-op (single pointer test) for the common function without typed locals, and
+ * idempotent, so repeated calls across the frame's lifetime stay balanced with the single
+ * per-CV-slot removal at teardown. */
+static zend_always_inline void zend_promote_frame_typed_cvs(zend_execute_data *ex)
+{
+	const zend_op_array *op_array = &ex->func->op_array;
+	zend_property_info **cv_types = op_array->cv_types;
+
+	if (EXPECTED(cv_types == NULL)) {
+		return;
+	}
+	zval *var = ZEND_CALL_VAR_NUM(ex, 0);
+	uint32_t i, n = op_array->last_var;
+	for (i = 0; i < n; i++) {
+		if (UNEXPECTED(cv_types[i] != NULL)) {
+			zend_promote_cv_to_typed_ref(&var[i], cv_types[i]);
+		}
+	}
+}
+
+/* If `slot` is a typed CV of frame `ex` that was promoted/aliased into a typed reference,
+ * remove its synthesized type source. Returns true if `slot` belongs to `ex`'s CV range
+ * (handled here, whether or not a source was actually removed), so a frame-walking caller
+ * can stop. No-op-returning-false unless `slot` lies in this frame's CV range. */
+static zend_always_inline bool zend_unset_cv_clear_type_source_in_frame(zend_execute_data *ex, zval *slot)
+{
+	const zend_op_array *op_array = &ex->func->op_array;
+	zend_property_info **cv_types = op_array->cv_types;
+	const zval *cv0 = ZEND_CALL_VAR_NUM(ex, 0);
+
+	if (slot >= cv0 && slot < cv0 + op_array->last_var) {
+		if (cv_types != NULL) {
+			uint32_t idx = (uint32_t)(slot - cv0);
+			if (cv_types[idx] != NULL
+			 && Z_ISREF_P(slot)
+			 && ZEND_REF_HAS_TYPE_SOURCES(Z_REF_P(slot))) {
+				ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), cv_types[idx]);
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+/* A by-name unset (`unset($name)`, `unset($GLOBALS['name'])`) reached a symbol table whose
+ * entry for `name` is an IS_INDIRECT pointing at the CV `slot`. The unset dtors the reference
+ * through that IS_INDIRECT entry, bypassing ZEND_UNSET_CV, so a typed local's synthesized type
+ * source must be removed first to keep the per-CV-slot ADD/DEL bookkeeping balanced (otherwise
+ * the reference is destroyed still carrying the source and zend_reference_destroy() asserts).
+ *
+ * The owning frame is not necessarily the current one: `unset($GLOBALS['x'])` runs in whatever
+ * function issued it, but the global symbol table's IS_INDIRECT points into the script's main
+ * frame (the CV lives there). Walk the call chain to find the frame whose CV range contains
+ * `slot` and clear the source there. The slot belongs to exactly one frame (CV arrays are
+ * disjoint VM-stack regions), and that frame is always a live ancestor reachable through
+ * prev_execute_data, so the walk terminates. Internal/dummy frames carry no op_array CVs and
+ * are skipped by the range test. */
+static zend_always_inline void zend_unset_cv_clear_type_source(zend_execute_data *ex, zval *slot)
+{
+	while (ex != NULL) {
+		if (ex->func != NULL
+		 && ZEND_USER_CODE(ex->func->common.type)
+		 && zend_unset_cv_clear_type_source_in_frame(ex, slot)) {
+			return;
+		}
+		ex = ex->prev_execute_data;
+	}
+}
+
+/* If `slot` is a typed CV of frame `ex` and currently holds IS_UNDEF, promote it to a typed
+ * reference (its synthesized type attached as a source). Returns true if `slot` belongs to
+ * `ex`'s CV range (handled here, whether or not it was promoted), so a frame-walking caller
+ * can stop. No-op-returning-false unless `slot` lies in this frame's CV range. */
+static zend_always_inline bool zend_promote_undef_cv_to_typed_ref_in_frame(zend_execute_data *ex, zval *slot)
+{
+	const zend_op_array *op_array = &ex->func->op_array;
+	zend_property_info **cv_types = op_array->cv_types;
+	zval *cv0 = ZEND_CALL_VAR_NUM(ex, 0);
+
+	if (slot >= cv0 && slot < cv0 + op_array->last_var) {
+		if (cv_types != NULL && Z_TYPE_P(slot) == IS_UNDEF) {
+			uint32_t idx = (uint32_t)(slot - cv0);
+			if (cv_types[idx] != NULL) {
+				ZVAL_MAKE_REF_EX(slot, 1);
+				ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), cv_types[idx]);
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+/* A by-name dynamic WRITE (`$$name = ...`, extract() overwrite/initialize, ...) resolved an
+ * IS_INDIRECT symbol-table entry straight into a CV `slot` that is still IS_UNDEF. A plain
+ * value/UNDEF slot takes the write as an unchecked copy (zend_assign / ZEND_TRY_ASSIGN_*),
+ * bypassing a typed local's declared type. Promoting the slot to a typed reference HERE -- at
+ * the write -- attaches the local's synthesized type as a source so the assign that follows
+ * routes through zend_assign_to_typed_ref()/zend_verify_ref_assignable_zval() and enforces the
+ * type (coercing in weak mode, throwing in strict / on a non-coercible value). Crucially this
+ * happens only on the write path: a read/isset/get_defined_vars() that observes the slot before
+ * any write still sees a bare IS_UNDEF, so undefined-variable semantics are unchanged.
+ *
+ * The owning frame is not necessarily the current one (`$GLOBALS['x'] = ...` runs in whatever
+ * function issued it, but the global symbol table's IS_INDIRECT points into the script's main
+ * frame). Walk the call chain to the frame whose CV range contains `slot` and promote there, so
+ * the type source is keyed by that frame's op_array->cv_types[idx] -- exactly the key the single
+ * per-CV-slot removal at teardown (i_free_compiled_variables() / zend_detach_symbol_table()) and
+ * by-name unset (zend_unset_cv_clear_type_source()) use, keeping ADD/DEL balanced. The slot
+ * belongs to exactly one frame (CV arrays are disjoint VM-stack regions) reachable through
+ * prev_execute_data, so the walk terminates. Internal/dummy frames carry no op_array CVs and are
+ * skipped by the range test. Idempotent: once promoted the slot is no longer IS_UNDEF, and a
+ * later by-name write that re-enters here finds a non-UNDEF slot (handled by
+ * zend_assign_to_typed_ref directly), so no second source is added. */
+static zend_always_inline void zend_promote_undef_cv_to_typed_ref(zend_execute_data *ex, zval *slot)
+{
+	while (ex != NULL) {
+		if (ex->func != NULL
+		 && ZEND_USER_CODE(ex->func->common.type)
+		 && zend_promote_undef_cv_to_typed_ref_in_frame(ex, slot)) {
+			return;
+		}
+		ex = ex->prev_execute_data;
+	}
+}
+
+/* If `slot` is a DEFINED typed CV of frame `ex`, promote it to a typed reference (its
+ * synthesized type attached as a source). Returns true if `slot` belongs to `ex`'s CV range
+ * (handled here, whether or not it was promoted), so a frame-walking caller can stop. No-op-
+ * returning-false unless `slot` lies in this frame's CV range. The defined-slot counterpart of
+ * zend_promote_undef_cv_to_typed_ref_in_frame(); zend_promote_cv_to_typed_ref() leaves an
+ * IS_UNDEF slot untouched (undefined-variable semantics preserved) and is idempotent on an
+ * already-promoted slot (dedup), so the single per-CV-slot teardown removal stays balanced. */
+static zend_always_inline bool zend_promote_defined_cv_to_typed_ref_in_frame(zend_execute_data *ex, zval *slot)
+{
+	const zend_op_array *op_array = &ex->func->op_array;
+	zend_property_info **cv_types = op_array->cv_types;
+	zval *cv0 = ZEND_CALL_VAR_NUM(ex, 0);
+
+	if (slot >= cv0 && slot < cv0 + op_array->last_var) {
+		if (cv_types != NULL) {
+			uint32_t idx = (uint32_t)(slot - cv0);
+			if (cv_types[idx] != NULL) {
+				zend_promote_cv_to_typed_ref(slot, cv_types[idx]);
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+/* A by-name dynamic WRITE through the GLOBAL symbol table (`$GLOBALS['name'] = ...`,
+ * `$GLOBALS['name'] += ...`, `$GLOBALS['name']++`) resolved an IS_INDIRECT entry straight into a
+ * CV `slot` that already holds a value. Unlike the function-local by-name path ($$name), which
+ * promotes a frame's typed CVs when its symbol table is handed out (zend_get_target_symbol_table
+ * -> zend_promote_frame_typed_cvs), the GLOBAL fetch returns &EG(symbol_table) directly and never
+ * promotes, so a DEFINED file-scope typed local is still a plain value at the write -- the ASSIGN
+ * / ASSIGN_OP / INC that follows would overwrite it unchecked, bypassing its declared type.
+ * Promoting the slot to a typed reference HERE attaches the local's synthesized type as a source
+ * so that store routes through zend_assign_to_typed_ref() / zend_binary_assign_op_typed_ref() /
+ * zend_incdec_typed_ref() and is type-checked (coerce in weak mode, throw in strict / on a
+ * non-coercible value), matching the static ($x = ...) and $$name paths. The still-UNDEF case is
+ * handled separately by zend_promote_undef_cv_to_typed_ref[_rw]() on the same fetch.
+ *
+ * The owning frame is the script's main frame (where the global table's IS_INDIRECT points), not
+ * necessarily the current one. Walk the call chain to the frame whose CV range contains `slot`
+ * and promote there, so the type source is keyed by that frame's op_array->cv_types[idx] -- the
+ * key the single per-CV-slot teardown removal (i_free_compiled_variables() /
+ * zend_detach_symbol_table()) and by-name unset (zend_unset_cv_clear_type_source()) use, keeping
+ * ADD/DEL balanced. The slot belongs to exactly one frame (CV arrays are disjoint VM-stack
+ * regions) reachable through prev_execute_data, so the walk terminates. Internal/dummy frames
+ * carry no op_array CVs and are skipped by the range test. Idempotent (zend_promote_cv_to_typed_ref
+ * dedups), so a repeated $GLOBALS write adds no second source. */
+static zend_always_inline void zend_promote_defined_cv_to_typed_ref(zend_execute_data *ex, zval *slot)
+{
+	while (ex != NULL) {
+		if (ex->func != NULL
+		 && ZEND_USER_CODE(ex->func->common.type)
+		 && zend_promote_defined_cv_to_typed_ref_in_frame(ex, slot)) {
+			return;
+		}
+		ex = ex->prev_execute_data;
+	}
+}
+
+/* RW (compound-assign / inc-dec) variant of zend_promote_undef_cv_to_typed_ref_in_frame(). A
+ * by-name RW write ($$name .= ..., $$name++) must first NULL-initialize the still-UNDEF slot --
+ * exactly as the static typed-CV RW path does (_get_zval_ptr_cv_BP_VAR_RW / ZEND_ASSIGN_OP_TYPED)
+ * after the undefined-variable warning -- so the binary op / increment runs on NULL rather than
+ * IS_UNDEF (which is not a valid scalar operand and would trip ZEND_UNREACHABLE() in
+ * zendi_try_convert_scalar_to_number()). For a typed CV the NULL is then wrapped in a typed
+ * reference so the compound/inc-dec store routes through zend_binary_assign_op_typed_ref() /
+ * zend_incdec_typed_ref() and is type-checked; for an untyped CV the slot is left as bare NULL
+ * (unchecked), matching the prior behavior. Returns true once the owning frame is found. */
+static zend_always_inline bool zend_promote_undef_cv_to_typed_ref_rw_in_frame(zend_execute_data *ex, zval *slot)
+{
+	const zend_op_array *op_array = &ex->func->op_array;
+	zend_property_info **cv_types = op_array->cv_types;
+	zval *cv0 = ZEND_CALL_VAR_NUM(ex, 0);
+
+	if (slot >= cv0 && slot < cv0 + op_array->last_var) {
+		ZEND_ASSERT(Z_TYPE_P(slot) == IS_UNDEF);
+		ZVAL_NULL(slot);
+		if (cv_types != NULL) {
+			uint32_t idx = (uint32_t)(slot - cv0);
+			if (cv_types[idx] != NULL) {
+				ZVAL_MAKE_REF_EX(slot, 1);
+				ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), cv_types[idx]);
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+/* RW counterpart of zend_promote_undef_cv_to_typed_ref(): see that function and
+ * zend_promote_undef_cv_to_typed_ref_rw_in_frame() for the rationale. Walks the call chain to the
+ * frame owning `slot` (which need not be the current one for $GLOBALS) and NULL-initializes /
+ * promotes there. The slot is always a CV of some live ancestor frame, so the walk terminates. */
+static zend_always_inline void zend_promote_undef_cv_to_typed_ref_rw(zend_execute_data *ex, zval *slot)
+{
+	while (ex != NULL) {
+		if (ex->func != NULL
+		 && ZEND_USER_CODE(ex->func->common.type)
+		 && zend_promote_undef_cv_to_typed_ref_rw_in_frame(ex, slot)) {
+			return;
+		}
+		ex = ex->prev_execute_data;
+	}
+}
+
+/* Undo a promote-on-write that did not store anything. `slot` was promoted to a typed
+ * reference wrapping IS_UNDEF by zend_promote_undef_cv_to_typed_ref() just before a by-name
+ * write, and that write then failed its type check. A typed-source reference can only wrap
+ * IS_UNDEF when it was freshly promoted that way (taking `&` of, or a typed property reference
+ * to, an uninitialized typed slot both throw at creation), so it is solely owned by this slot
+ * (refcount 1, exactly one synthesized source). Drop the type source -- keeping the per-CV-slot
+ * ADD/DEL balanced -- free the reference and restore the bare IS_UNDEF slot, so a failed by-name
+ * write leaves the local undefined exactly as a failed static assignment ($u = ...) does. No-op
+ * unless `slot` is such a freshly-promoted reference. */
+static zend_always_inline void zend_collapse_promoted_undef_ref(zval *slot)
+{
+	if (UNEXPECTED(Z_ISREF_P(slot))) {
+		zend_reference *ref = Z_REF_P(slot);
+		if (Z_TYPE(ref->val) == IS_UNDEF
+		 && GC_REFCOUNT(ref) == 1
+		 && ZEND_REF_HAS_TYPE_SOURCES(ref)) {
+			zend_ref_del_type_source(&ZEND_REF_TYPE_SOURCES(ref), ZEND_REF_FIRST_SOURCE(ref));
+			ZEND_ASSERT(!ZEND_REF_HAS_TYPE_SOURCES(ref));
+			efree_size(ref, sizeof(zend_reference));
+			ZVAL_UNDEF(slot);
+		}
+	}
+}
+
 zend_never_inline ZEND_COLD void zend_match_unhandled_error(const zval *value);
 
 /* Call this to handle the timeout or the interrupt function. It will set
