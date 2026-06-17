@@ -1124,7 +1124,26 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_STATIC
 		HANDLE_EXCEPTION();
 	}
 
+	/* `C::$s = &$cv` aliases the source CV (OP_DATA) into the static-property reference.
+	 * Forbid an uninitialized typed local: check the raw OP_DATA CV slot before the
+	 * BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. */
+	if ((opline+1)->op1_type == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = get_zval_ptr_ptr((opline+1)->op1_type, (opline+1)->op1, BP_VAR_W);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the static-property reference is type-checked. */
+	if ((opline+1)->op1_type == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, (opline+1)->op1_type, (opline+1)->op1.var, value_ptr);
+	}
 
 	if ((opline+1)->op1_type == IS_VAR && (opline->extended_value & ZEND_RETURNS_FUNCTION) && UNEXPECTED(!Z_ISREF_P(value_ptr))) {
 		if (UNEXPECTED(!zend_wrong_assign_to_variable_reference(prop, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC))) {
@@ -7964,11 +7983,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_CONST == IS_VAR || IS_CONST == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -8395,6 +8432,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CO
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -8413,6 +8463,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CO
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -10481,11 +10536,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_CONST == IS_VAR || IS_CONST == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -10806,6 +10879,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CO
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -10824,6 +10910,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CO
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -10963,18 +11054,56 @@ fetch_this:
 				goto fetch_this;
 			}
 			if (type == BP_VAR_W) {
-				ZVAL_NULL(retval);
+				/* A by-name write ($$name = ...) into a still-UNDEF slot. If the slot is a
+				 * typed CV, promote it to a typed reference so the ASSIGN that follows is
+				 * type-checked (closes the uninitialized-first-write hole); the slot is then
+				 * IS_REFERENCE and must not be reset to NULL. Otherwise initialise to NULL as
+				 * before. */
+				zend_promote_undef_cv_to_typed_ref(execute_data, retval);
+				if (Z_TYPE_P(retval) != IS_REFERENCE) {
+					ZVAL_NULL(retval);
+				}
 			} else if (type == BP_VAR_IS || type == BP_VAR_UNSET) {
 				retval = &EG(uninitialized_zval);
 			} else {
 				zend_error_unchecked(E_WARNING, "Undefined %svariable $%S",
 					(opline->extended_value & ZEND_FETCH_GLOBAL ? "global " : ""), name);
 				if (type == BP_VAR_RW && !EG(exception)) {
-					ZVAL_NULL(retval);
+					/* A by-name compound assign / inc-dec ($$name .= ..., $$name++)
+					 * into a still-UNDEF slot. Mirror the BP_VAR_W path, but use the
+					 * RW variant: the slot is first NULL-initialized (as the static
+					 * typed-CV RW path does after the undefined-variable warning) so
+					 * the binary op / increment runs on NULL, and if the slot is a
+					 * typed CV that NULL is wrapped in a typed reference so the
+					 * compound/inc-dec store that follows is type-checked (closes the
+					 * uninitialized-first-write hole on the RW fetch path); the slot
+					 * is then IS_REFERENCE and must not be reset. Untyped/non-frame
+					 * slots fall through to a bare NULL as before. */
+					zend_promote_undef_cv_to_typed_ref_rw(execute_data, retval);
+					if (Z_TYPE_P(retval) != IS_REFERENCE) {
+						ZVAL_NULL(retval);
+					}
 				} else {
 					retval = &EG(uninitialized_zval);
 				}
 			}
+		} else if ((type == BP_VAR_W || type == BP_VAR_RW)
+				&& (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+			/* A by-name WRITE through the GLOBAL symbol table resolved to a DEFINED CV slot.
+			 * Two callers reach here with a DEFINED slot:
+			 *   - $GLOBALS['name'] = ... / += ... / ++  (ZEND_FETCH_GLOBAL), and
+			 *   - the dynamic `global $$name` slow path: FETCH_W with ZEND_FETCH_GLOBAL_LOCK
+			 *     returns this INDIRECT, and the ASSIGN_REF that follows binds the global into
+			 *     the function-local CV by reference.
+			 * Either way the GLOBAL fetch returns &EG(symbol_table) without promoting typed CVs
+			 * (unlike the $$name/local path, which promotes via zend_get_target_symbol_table),
+			 * so a file-scope typed local is still a plain value here -- the ASSIGN/ASSIGN_OP/INC
+			 * ($GLOBALS) or the ASSIGN_REF bind (global $$name) that follows would share/overwrite
+			 * it unchecked, bypassing its declared type. Promote it to a typed reference so that
+			 * write (or the reference shared by the bind) is type-checked, matching the static,
+			 * $$name and $GLOBALS paths. No-op for an untyped CV, a non-frame slot, or a slot
+			 * already a reference. The UNDEF case is handled by the branch above. */
+			zend_promote_defined_cv_to_typed_ref(execute_data, retval);
 		}
 	}
 
@@ -11445,11 +11574,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_CONST == IS_VAR || IS_CONST == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -11600,6 +11747,22 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_UNSET_VAR_SPE
 	}
 
 	target_symbol_table = zend_get_target_symbol_table(opline->extended_value EXECUTE_DATA_CC);
+	/* If the name resolves to a typed local that was promoted/aliased into a reference,
+	 * drop its type source before zend_hash_del_ind() dtors the reference (it does so
+	 * through the IS_INDIRECT entry, which never goes through ZEND_UNSET_CV).
+	 *
+	 * A local-table unset can only reach the current frame's CVs (gate on this frame having
+	 * typed locals). A global-table unset (`unset($GLOBALS['x'])`) reaches the script's main
+	 * frame, whose CVs may be typed even when the frame issuing the unset is not, so it must
+	 * be checked regardless of the current frame; zend_unset_cv_clear_type_source() walks the
+	 * call chain to the owning frame. */
+	if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)
+	 || (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+		zval *zv = zend_hash_find(target_symbol_table, name);
+		if (zv && Z_TYPE_P(zv) == IS_INDIRECT) {
+			zend_unset_cv_clear_type_source(execute_data, Z_INDIRECT_P(zv));
+		}
+	}
 	zend_hash_del_ind(target_symbol_table, name);
 
 	if (IS_CONST != IS_CONST) {
@@ -11691,6 +11854,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CO
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -11709,6 +11885,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CO
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -13100,11 +13281,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_CONST == IS_VAR || IS_CONST == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -13429,6 +13628,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CO
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -13447,6 +13659,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CO
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -16541,6 +16758,22 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_UNSET_VAR_SPE
 	}
 
 	target_symbol_table = zend_get_target_symbol_table(opline->extended_value EXECUTE_DATA_CC);
+	/* If the name resolves to a typed local that was promoted/aliased into a reference,
+	 * drop its type source before zend_hash_del_ind() dtors the reference (it does so
+	 * through the IS_INDIRECT entry, which never goes through ZEND_UNSET_CV).
+	 *
+	 * A local-table unset can only reach the current frame's CVs (gate on this frame having
+	 * typed locals). A global-table unset (`unset($GLOBALS['x'])`) reaches the script's main
+	 * frame, whose CVs may be typed even when the frame issuing the unset is not, so it must
+	 * be checked regardless of the current frame; zend_unset_cv_clear_type_source() walks the
+	 * call chain to the owning frame. */
+	if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)
+	 || (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+		zval *zv = zend_hash_find(target_symbol_table, name);
+		if (zv && Z_TYPE_P(zv) == IS_INDIRECT) {
+			zend_unset_cv_clear_type_source(execute_data, Z_INDIRECT_P(zv));
+		}
+	}
 	zend_hash_del_ind(target_symbol_table, name);
 
 	if ((IS_TMP_VAR|IS_VAR) != IS_CONST) {
@@ -19356,11 +19589,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_TMP_VAR == IS_VAR || IS_TMP_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -19726,6 +19977,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_TM
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -19744,6 +20008,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_TM
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -20892,11 +21161,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_TMP_VAR == IS_VAR || IS_TMP_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -21213,6 +21500,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_TM
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -21231,6 +21531,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_TM
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -21414,18 +21719,56 @@ fetch_this:
 				goto fetch_this;
 			}
 			if (type == BP_VAR_W) {
-				ZVAL_NULL(retval);
+				/* A by-name write ($$name = ...) into a still-UNDEF slot. If the slot is a
+				 * typed CV, promote it to a typed reference so the ASSIGN that follows is
+				 * type-checked (closes the uninitialized-first-write hole); the slot is then
+				 * IS_REFERENCE and must not be reset to NULL. Otherwise initialise to NULL as
+				 * before. */
+				zend_promote_undef_cv_to_typed_ref(execute_data, retval);
+				if (Z_TYPE_P(retval) != IS_REFERENCE) {
+					ZVAL_NULL(retval);
+				}
 			} else if (type == BP_VAR_IS || type == BP_VAR_UNSET) {
 				retval = &EG(uninitialized_zval);
 			} else {
 				zend_error_unchecked(E_WARNING, "Undefined %svariable $%S",
 					(opline->extended_value & ZEND_FETCH_GLOBAL ? "global " : ""), name);
 				if (type == BP_VAR_RW && !EG(exception)) {
-					ZVAL_NULL(retval);
+					/* A by-name compound assign / inc-dec ($$name .= ..., $$name++)
+					 * into a still-UNDEF slot. Mirror the BP_VAR_W path, but use the
+					 * RW variant: the slot is first NULL-initialized (as the static
+					 * typed-CV RW path does after the undefined-variable warning) so
+					 * the binary op / increment runs on NULL, and if the slot is a
+					 * typed CV that NULL is wrapped in a typed reference so the
+					 * compound/inc-dec store that follows is type-checked (closes the
+					 * uninitialized-first-write hole on the RW fetch path); the slot
+					 * is then IS_REFERENCE and must not be reset. Untyped/non-frame
+					 * slots fall through to a bare NULL as before. */
+					zend_promote_undef_cv_to_typed_ref_rw(execute_data, retval);
+					if (Z_TYPE_P(retval) != IS_REFERENCE) {
+						ZVAL_NULL(retval);
+					}
 				} else {
 					retval = &EG(uninitialized_zval);
 				}
 			}
+		} else if ((type == BP_VAR_W || type == BP_VAR_RW)
+				&& (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+			/* A by-name WRITE through the GLOBAL symbol table resolved to a DEFINED CV slot.
+			 * Two callers reach here with a DEFINED slot:
+			 *   - $GLOBALS['name'] = ... / += ... / ++  (ZEND_FETCH_GLOBAL), and
+			 *   - the dynamic `global $$name` slow path: FETCH_W with ZEND_FETCH_GLOBAL_LOCK
+			 *     returns this INDIRECT, and the ASSIGN_REF that follows binds the global into
+			 *     the function-local CV by reference.
+			 * Either way the GLOBAL fetch returns &EG(symbol_table) without promoting typed CVs
+			 * (unlike the $$name/local path, which promotes via zend_get_target_symbol_table),
+			 * so a file-scope typed local is still a plain value here -- the ASSIGN/ASSIGN_OP/INC
+			 * ($GLOBALS) or the ASSIGN_REF bind (global $$name) that follows would share/overwrite
+			 * it unchecked, bypassing its declared type. Promote it to a typed reference so that
+			 * write (or the reference shared by the bind) is type-checked, matching the static,
+			 * $$name and $GLOBALS paths. No-op for an untyped CV, a non-frame slot, or a slot
+			 * already a reference. The UNDEF case is handled by the branch above. */
+			zend_promote_defined_cv_to_typed_ref(execute_data, retval);
 		}
 	}
 
@@ -21657,11 +22000,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_TMP_VAR == IS_VAR || IS_TMP_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -21907,6 +22268,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_TM
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -21925,6 +22299,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_TM
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -22756,11 +23135,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_TMP_VAR == IS_VAR || IS_TMP_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -23081,6 +23478,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_TM
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -23099,6 +23509,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_TM
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -23175,12 +23590,28 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_BIND_LEXICAL_
 
 	closure = _get_zval_ptr_tmp(opline->op1.var EXECUTE_DATA_CC);
 	if (opline->extended_value & ZEND_BIND_REF) {
-		/* By-ref binding */
+		/* By-ref binding. `use (&$cv)` aliases the captured local into a reference shared
+		 * with the closure. When the captured variable is a typed local, forbid an
+		 * uninitialized one (check the raw CV slot before the BP_VAR_W fetch coerces
+		 * IS_UNDEF to IS_NULL) and, when its slot is freshly wrapped, attach its type so a
+		 * later write through the captured reference is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		var = _get_zval_ptr_cv_BP_VAR_W(opline->op2.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(var)) {
 			Z_ADDREF_P(var);
 		} else {
 			ZVAL_MAKE_REF_EX(var, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op2.var, Z_REF_P(var));
+			}
 		}
 	} else {
 		var = EX_VAR(opline->op2.var);
@@ -25448,7 +25879,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -25486,7 +25939,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -25817,11 +26292,32 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_SEND_REF_SPEC
 		arg = ZEND_CALL_VAR(EX(call), opline->result.var);
 	}
 
+	/* Forbid passing an uninitialized typed local by reference: check the raw CV
+	 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+	 * slot has not been written yet and may hold a stale value from a prior call
+	 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+	 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+	 * data. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			ZVAL_UNDEF(arg);
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			HANDLE_EXCEPTION();
+		}
+	}
 	varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	if (Z_ISREF_P(varptr)) {
 		Z_ADDREF_P(varptr);
 	} else {
 		ZVAL_MAKE_REF_EX(varptr, 2);
+		/* Typed local passed by reference: attach its type to the new reference so
+		 * the callee cannot write through it in a type-violating way. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+		}
 	}
 	ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -25854,11 +26350,32 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_SEND_VAR_EX_S
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -26097,11 +26614,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_VAR == IS_VAR || IS_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -26404,6 +26939,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_VA
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -26422,6 +26970,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_VA
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -28150,7 +28703,28 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -28187,7 +28761,28 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -28356,11 +28951,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_VAR == IS_VAR || IS_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -28662,6 +29275,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_VA
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -28680,6 +29306,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_VA
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -28756,6 +29387,18 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SP
 	zend_refcounted *garbage = NULL;
 
 	SAVE_OPLINE();
+	/* Forbid `$target = &$source` when the source is an uninitialized typed local:
+	 * the raw CV slot must be checked before the BP_VAR_W fetch below coerces its
+	 * IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
 	value_ptr = _get_zval_ptr_ptr_var(opline->op2.var EXECUTE_DATA_CC);
 	variable_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
@@ -28771,7 +29414,25 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SP
 		variable_ptr = zend_wrong_assign_to_variable_reference(
 			variable_ptr, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC);
 	} else {
-		zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		/* Typed local variables: if either side of `$target = &$source` is a typed
+		 * CV, route through a helper that enforces the type and attaches it as a
+		 * source on the resulting (shared) reference. Only IS_CV operands can be
+		 * typed locals. */
+		zend_property_info *target_info = NULL, *source_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			if (IS_VAR == IS_CV) {
+				target_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			}
+			if (IS_VAR == IS_CV) {
+				source_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op2.var)];
+			}
+		}
+		if (UNEXPECTED(target_info || source_info)) {
+			variable_ptr = zend_assign_to_typed_cv_reference(
+				target_info, source_info, variable_ptr, value_ptr, &garbage EXECUTE_DATA_CC);
+		} else {
+			zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		}
 	}
 
 	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
@@ -29855,11 +30516,32 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_SEND_REF_SPEC
 		arg = ZEND_CALL_VAR(EX(call), opline->result.var);
 	}
 
+	/* Forbid passing an uninitialized typed local by reference: check the raw CV
+	 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+	 * slot has not been written yet and may hold a stale value from a prior call
+	 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+	 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+	 * data. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			ZVAL_UNDEF(arg);
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			HANDLE_EXCEPTION();
+		}
+	}
 	varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	if (Z_ISREF_P(varptr)) {
 		Z_ADDREF_P(varptr);
 	} else {
 		ZVAL_MAKE_REF_EX(varptr, 2);
+		/* Typed local passed by reference: attach its type to the new reference so
+		 * the callee cannot write through it in a type-violating way. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+		}
 	}
 	ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -29892,11 +30574,32 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_SEND_VAR_EX_S
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -29958,11 +30661,32 @@ static ZEND_VM_HOT ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_S
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -30127,11 +30851,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_VAR == IS_VAR || IS_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -30302,6 +31044,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_VA
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -30320,6 +31075,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_VA
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -30394,7 +31154,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_MAKE_REF_SPEC
 	zval *op1 = EX_VAR(opline->op1.var);
 
 	if (IS_VAR == IS_CV) {
+		zend_property_info *cv_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			cv_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+		}
 		if (UNEXPECTED(Z_TYPE_P(op1) == IS_UNDEF)) {
+			/* Forbid wrapping an uninitialized typed local into a reference (would
+			 * attach the type source to a reference holding an uninitialized slot). */
+			if (UNEXPECTED(cv_info != NULL)) {
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(cv_info);
+				UNDEF_RESULT();
+				HANDLE_EXCEPTION();
+			}
 			ZVAL_NEW_EMPTY_REF(op1);
 			Z_SET_REFCOUNT_P(op1, 2);
 			ZVAL_NULL(Z_REFVAL_P(op1));
@@ -30404,6 +31176,10 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_MAKE_REF_SPEC
 				Z_ADDREF_P(op1);
 			} else {
 				ZVAL_MAKE_REF_EX(op1, 2);
+				/* Newly created reference for a typed local: attach its type. */
+				if (UNEXPECTED(cv_info != NULL)) {
+					ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(op1), cv_info);
+				}
 			}
 			ZVAL_REF(EX_VAR(opline->result.var), Z_REF_P(op1));
 		}
@@ -31981,6 +32757,18 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SP
 	zend_refcounted *garbage = NULL;
 
 	SAVE_OPLINE();
+	/* Forbid `$target = &$source` when the source is an uninitialized typed local:
+	 * the raw CV slot must be checked before the BP_VAR_W fetch below coerces its
+	 * IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op2.var EXECUTE_DATA_CC);
 	variable_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
@@ -31996,7 +32784,25 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SP
 		variable_ptr = zend_wrong_assign_to_variable_reference(
 			variable_ptr, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC);
 	} else {
-		zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		/* Typed local variables: if either side of `$target = &$source` is a typed
+		 * CV, route through a helper that enforces the type and attaches it as a
+		 * source on the resulting (shared) reference. Only IS_CV operands can be
+		 * typed locals. */
+		zend_property_info *target_info = NULL, *source_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			if (IS_VAR == IS_CV) {
+				target_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			}
+			if (IS_CV == IS_CV) {
+				source_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op2.var)];
+			}
+		}
+		if (UNEXPECTED(target_info || source_info)) {
+			variable_ptr = zend_assign_to_typed_cv_reference(
+				target_info, source_info, variable_ptr, value_ptr, &garbage EXECUTE_DATA_CC);
+		} else {
+			zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		}
 	}
 
 	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
@@ -32022,7 +32828,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -32060,7 +32888,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -32235,11 +33085,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_VAR == IS_VAR || IS_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -32542,6 +33410,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_VA
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -32560,6 +33441,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_VA
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -33992,7 +34878,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = &EX(This);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -34030,7 +34939,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = &EX(This);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -34785,6 +35717,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_UN
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = NULL;
 
 				/* If a function call result is yielded and the function did
@@ -34803,6 +35748,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_UN
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -36087,7 +37037,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = &EX(This);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -36124,7 +37096,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = &EX(This);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -36675,6 +37669,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_UN
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = NULL;
 
 				/* If a function call result is yielded and the function did
@@ -36693,6 +37700,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_UN
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -37224,6 +38236,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_UN
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = NULL;
 
 				/* If a function call result is yielded and the function did
@@ -37242,6 +38267,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_UN
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -38662,7 +39692,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = &EX(This);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -38700,7 +39753,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = &EX(This);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -39264,6 +40340,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_UN
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = NULL;
 
 				/* If a function call result is yielded and the function did
@@ -39282,6 +40371,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_UN
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -39637,6 +40731,138 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ECHO_SPEC_CV_
 		}
 		zend_string_release_ex(str, 0);
 	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_PRE_INC_TYPED_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	var_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	if (IS_CV == IS_CV && UNEXPECTED(Z_TYPE_P(var_ptr) == IS_UNDEF)) {
+		ZVAL_UNDEFINED_OP1();
+		ZVAL_NULL(var_ptr);
+	}
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_incdec_typed_ref(ref, NULL OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_incdec_typed_prop(info, var_ptr, NULL OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_PRE_DEC_TYPED_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	var_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	if (IS_CV == IS_CV && UNEXPECTED(Z_TYPE_P(var_ptr) == IS_UNDEF)) {
+		ZVAL_UNDEFINED_OP1();
+		ZVAL_NULL(var_ptr);
+	}
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_incdec_typed_ref(ref, NULL OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_incdec_typed_prop(info, var_ptr, NULL OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_POST_INC_TYPED_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	var_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	if (IS_CV == IS_CV && UNEXPECTED(Z_TYPE_P(var_ptr) == IS_UNDEF)) {
+		ZVAL_UNDEFINED_OP1();
+		ZVAL_NULL(var_ptr);
+	}
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_incdec_typed_ref(ref, EX_VAR(opline->result.var) OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_incdec_typed_prop(info, var_ptr, EX_VAR(opline->result.var) OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_POST_DEC_TYPED_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	var_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	if (IS_CV == IS_CV && UNEXPECTED(Z_TYPE_P(var_ptr) == IS_UNDEF)) {
+		ZVAL_UNDEFINED_OP1();
+		ZVAL_NULL(var_ptr);
+	}
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_incdec_typed_ref(ref, EX_VAR(opline->result.var) OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_incdec_typed_prop(info, var_ptr, EX_VAR(opline->result.var) OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
 
 
 	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
@@ -43554,6 +44780,126 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_SPEC_C
 	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
 }
 
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_UNUSED_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = RT_CONSTANT(opline, opline->op2);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(0)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = RT_CONSTANT(opline, opline->op2);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(1)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OP_TYPED_SPEC_CV_CONST_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	zval *value;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	value = RT_CONSTANT(opline, opline->op2);
+	var_ptr = _get_zval_ptr_cv_BP_VAR_RW(opline->op1.var EXECUTE_DATA_CC);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_binary_assign_op_typed_ref(ref, value OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_binary_assign_op_typed_prop(info, var_ptr, value OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* ++/-- on a typed local CV. Emitted by the compiler in place of the plain
+ * ZEND_PRE_INC / ZEND_PRE_DEC / ZEND_POST_INC / ZEND_POST_DEC when op1 is a
+ * typed local. The increment/decrement is computed first (so int overflow can
+ * be detected) and then verified against the declared type exactly as for a
+ * typed property (zend_incdec_typed_prop): an int that overflows to float is
+ * rejected with a TypeError unless the type admits float, otherwise the value
+ * is coerced/verified honoring strict/weak mode. A typed reference is handled
+ * through its sources, matching the untyped helpers. The opcode numbers keep
+ * the increment/decrement parity required by ZEND_IS_INCREMENT() and the
+ * POST = PRE + 2 relationship used by zend_do_free()'s $i++ -> ++$i rewrite. */
 static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_REF_SPEC_CV_CONST_OP_DATA_VAR_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
 {
 	USE_OPLINE
@@ -43564,7 +44910,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = EX_VAR(opline->op1.var);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -43602,7 +44971,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = EX_VAR(opline->op1.var);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -43988,11 +45380,33 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_SEND_REF_SPEC
 		arg = ZEND_CALL_VAR(EX(call), opline->result.var);
 	}
 
+	/* Forbid passing an uninitialized typed local by reference: check the raw CV
+	 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+	 * slot has not been written yet and may hold a stale value from a prior call
+	 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+	 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+	 * data. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			ZVAL_UNDEF(arg);
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			HANDLE_EXCEPTION();
+		}
+	}
 	varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 	if (Z_ISREF_P(varptr)) {
 		Z_ADDREF_P(varptr);
 	} else {
 		ZVAL_MAKE_REF_EX(varptr, 2);
+		/* Typed local passed by reference: attach its type to the new reference so
+		 * the callee cannot write through it in a type-violating way. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+		}
 	}
 	ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -44026,11 +45440,33 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_SEND_VAR_EX_S
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -44075,11 +45511,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_CV == IS_VAR || IS_CV == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -44600,6 +46054,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CV
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -44618,6 +46085,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CV
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -44734,6 +46206,20 @@ check_indirect:
 			}
 		}
 	}
+
+	/* `global $x` binds the imported global into the function-local CV by reference: the slot
+	 * is wrapped in a reference below and that reference is shared with the local. If the global
+	 * resolved to a file-scope typed local (its owning frame's cv_types[idx] != NULL), the bind
+	 * would otherwise share a *plain* reference and writes through the local alias would bypass
+	 * the declared type. Promote the slot to a typed reference here -- attaching the local's
+	 * synthesized type as a source -- so the existing Z_ISREF_P branch below shares that typed
+	 * reference and every write routes through zend_verify_ref_assignable_zval (coerce in weak
+	 * mode, throw in strict / on a non-coercible value), matching the static, $$name and
+	 * $GLOBALS paths. The slot was NULL-initialized above if it was IS_UNDEF, so the defined-CV
+	 * promotion covers both an assigned and a freshly-imported undefined global. No-op for an
+	 * untyped CV, a non-frame slot, or a slot already a (typed) reference; idempotent. The owning
+	 * frame is the script's main frame, walked via prev_execute_data. */
+	zend_promote_defined_cv_to_typed_ref(execute_data, value);
 
 	if (UNEXPECTED(!Z_ISREF_P(value))) {
 		ZVAL_MAKE_REF_EX(value, 2);
@@ -47371,6 +48857,126 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_SPEC_C
 	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
 }
 
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_UNUSED_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(0)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(1)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OP_TYPED_SPEC_CV_TMP_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	zval *value;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
+	var_ptr = _get_zval_ptr_cv_BP_VAR_RW(opline->op1.var EXECUTE_DATA_CC);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_binary_assign_op_typed_ref(ref, value OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_binary_assign_op_typed_prop(info, var_ptr, value OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* ++/-- on a typed local CV. Emitted by the compiler in place of the plain
+ * ZEND_PRE_INC / ZEND_PRE_DEC / ZEND_POST_INC / ZEND_POST_DEC when op1 is a
+ * typed local. The increment/decrement is computed first (so int overflow can
+ * be detected) and then verified against the declared type exactly as for a
+ * typed property (zend_incdec_typed_prop): an int that overflows to float is
+ * rejected with a TypeError unless the type admits float, otherwise the value
+ * is coerced/verified honoring strict/weak mode. A typed reference is handled
+ * through its sources, matching the untyped helpers. The opcode numbers keep
+ * the increment/decrement parity required by ZEND_IS_INCREMENT() and the
+ * POST = PRE + 2 relationship used by zend_do_free()'s $i++ -> ++$i rewrite. */
 static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_REF_SPEC_CV_TMP_OP_DATA_VAR_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
 {
 	USE_OPLINE
@@ -47381,7 +48987,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = EX_VAR(opline->op1.var);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -47418,7 +49046,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = EX_VAR(opline->op1.var);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -47738,11 +49388,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_CV == IS_VAR || IS_CV == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -48212,6 +49880,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CV
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -48230,6 +49911,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CV
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -48299,6 +49985,82 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CV
 	ZEND_VM_RETURN();
 }
 
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_UNUSED_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_var(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(0)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_var(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(1)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
 static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SPEC_CV_VAR_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
 {
 	USE_OPLINE
@@ -48307,6 +50069,18 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SP
 	zend_refcounted *garbage = NULL;
 
 	SAVE_OPLINE();
+	/* Forbid `$target = &$source` when the source is an uninitialized typed local:
+	 * the raw CV slot must be checked before the BP_VAR_W fetch below coerces its
+	 * IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
 	value_ptr = _get_zval_ptr_ptr_var(opline->op2.var EXECUTE_DATA_CC);
 	variable_ptr = EX_VAR(opline->op1.var);
 
@@ -48322,7 +50096,25 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SP
 		variable_ptr = zend_wrong_assign_to_variable_reference(
 			variable_ptr, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC);
 	} else {
-		zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		/* Typed local variables: if either side of `$target = &$source` is a typed
+		 * CV, route through a helper that enforces the type and attaches it as a
+		 * source on the resulting (shared) reference. Only IS_CV operands can be
+		 * typed locals. */
+		zend_property_info *target_info = NULL, *source_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			if (IS_CV == IS_CV) {
+				target_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			}
+			if (IS_VAR == IS_CV) {
+				source_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op2.var)];
+			}
+		}
+		if (UNEXPECTED(target_info || source_info)) {
+			variable_ptr = zend_assign_to_typed_cv_reference(
+				target_info, source_info, variable_ptr, value_ptr, &garbage EXECUTE_DATA_CC);
+		} else {
+			zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		}
 	}
 
 	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
@@ -48558,18 +50350,56 @@ fetch_this:
 				goto fetch_this;
 			}
 			if (type == BP_VAR_W) {
-				ZVAL_NULL(retval);
+				/* A by-name write ($$name = ...) into a still-UNDEF slot. If the slot is a
+				 * typed CV, promote it to a typed reference so the ASSIGN that follows is
+				 * type-checked (closes the uninitialized-first-write hole); the slot is then
+				 * IS_REFERENCE and must not be reset to NULL. Otherwise initialise to NULL as
+				 * before. */
+				zend_promote_undef_cv_to_typed_ref(execute_data, retval);
+				if (Z_TYPE_P(retval) != IS_REFERENCE) {
+					ZVAL_NULL(retval);
+				}
 			} else if (type == BP_VAR_IS || type == BP_VAR_UNSET) {
 				retval = &EG(uninitialized_zval);
 			} else {
 				zend_error_unchecked(E_WARNING, "Undefined %svariable $%S",
 					(opline->extended_value & ZEND_FETCH_GLOBAL ? "global " : ""), name);
 				if (type == BP_VAR_RW && !EG(exception)) {
-					ZVAL_NULL(retval);
+					/* A by-name compound assign / inc-dec ($$name .= ..., $$name++)
+					 * into a still-UNDEF slot. Mirror the BP_VAR_W path, but use the
+					 * RW variant: the slot is first NULL-initialized (as the static
+					 * typed-CV RW path does after the undefined-variable warning) so
+					 * the binary op / increment runs on NULL, and if the slot is a
+					 * typed CV that NULL is wrapped in a typed reference so the
+					 * compound/inc-dec store that follows is type-checked (closes the
+					 * uninitialized-first-write hole on the RW fetch path); the slot
+					 * is then IS_REFERENCE and must not be reset. Untyped/non-frame
+					 * slots fall through to a bare NULL as before. */
+					zend_promote_undef_cv_to_typed_ref_rw(execute_data, retval);
+					if (Z_TYPE_P(retval) != IS_REFERENCE) {
+						ZVAL_NULL(retval);
+					}
 				} else {
 					retval = &EG(uninitialized_zval);
 				}
 			}
+		} else if ((type == BP_VAR_W || type == BP_VAR_RW)
+				&& (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+			/* A by-name WRITE through the GLOBAL symbol table resolved to a DEFINED CV slot.
+			 * Two callers reach here with a DEFINED slot:
+			 *   - $GLOBALS['name'] = ... / += ... / ++  (ZEND_FETCH_GLOBAL), and
+			 *   - the dynamic `global $$name` slow path: FETCH_W with ZEND_FETCH_GLOBAL_LOCK
+			 *     returns this INDIRECT, and the ASSIGN_REF that follows binds the global into
+			 *     the function-local CV by reference.
+			 * Either way the GLOBAL fetch returns &EG(symbol_table) without promoting typed CVs
+			 * (unlike the $$name/local path, which promotes via zend_get_target_symbol_table),
+			 * so a file-scope typed local is still a plain value here -- the ASSIGN/ASSIGN_OP/INC
+			 * ($GLOBALS) or the ASSIGN_REF bind (global $$name) that follows would share/overwrite
+			 * it unchecked, bypassing its declared type. Promote it to a typed reference so that
+			 * write (or the reference shared by the bind) is type-checked, matching the static,
+			 * $$name and $GLOBALS paths. No-op for an untyped CV, a non-frame slot, or a slot
+			 * already a reference. The UNDEF case is handled by the branch above. */
+			zend_promote_defined_cv_to_typed_ref(execute_data, retval);
 		}
 	}
 
@@ -49292,11 +51122,33 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_SEND_REF_SPEC
 		arg = ZEND_CALL_VAR(EX(call), opline->result.var);
 	}
 
+	/* Forbid passing an uninitialized typed local by reference: check the raw CV
+	 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+	 * slot has not been written yet and may hold a stale value from a prior call
+	 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+	 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+	 * data. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			ZVAL_UNDEF(arg);
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			HANDLE_EXCEPTION();
+		}
+	}
 	varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 	if (Z_ISREF_P(varptr)) {
 		Z_ADDREF_P(varptr);
 	} else {
 		ZVAL_MAKE_REF_EX(varptr, 2);
+		/* Typed local passed by reference: attach its type to the new reference so
+		 * the callee cannot write through it in a type-violating way. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+		}
 	}
 	ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -49330,11 +51182,33 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_SEND_VAR_EX_S
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -49397,11 +51271,33 @@ static ZEND_VM_HOT ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_S
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -49446,11 +51342,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_CV == IS_VAR || IS_CV == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -49580,6 +51494,21 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_UNSET_CV_SPEC
 	if (Z_REFCOUNTED_P(var)) {
 		zend_refcounted *garbage = Z_COUNTED_P(var);
 
+		/* A typed local that was wrapped into a reference (aliased by `&$cv`, passed by
+		 * reference, or promoted for a by-name write) carries its synthesized type as a
+		 * source on that reference. Unsetting the CV may release the reference, so remove
+		 * the source first, mirroring the typed-property unset path and frame teardown. This
+		 * keeps the ADD/DEL bookkeeping balanced one-per-CV-slot (the teardown DEL sites skip
+		 * an UNDEF slot). */
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)
+		 && UNEXPECTED(Z_ISREF_P(var))
+		 && ZEND_REF_HAS_TYPE_SOURCES(Z_REF_P(var))) {
+			zend_property_info *cv_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			if (cv_info != NULL) {
+				ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(var), cv_info);
+			}
+		}
+
 		ZVAL_UNDEF(var);
 		SAVE_OPLINE();
 		GC_DTOR(garbage);
@@ -49619,6 +51548,22 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_UNSET_VAR_SPE
 	}
 
 	target_symbol_table = zend_get_target_symbol_table(opline->extended_value EXECUTE_DATA_CC);
+	/* If the name resolves to a typed local that was promoted/aliased into a reference,
+	 * drop its type source before zend_hash_del_ind() dtors the reference (it does so
+	 * through the IS_INDIRECT entry, which never goes through ZEND_UNSET_CV).
+	 *
+	 * A local-table unset can only reach the current frame's CVs (gate on this frame having
+	 * typed locals). A global-table unset (`unset($GLOBALS['x'])`) reaches the script's main
+	 * frame, whose CVs may be typed even when the frame issuing the unset is not, so it must
+	 * be checked regardless of the current frame; zend_unset_cv_clear_type_source() walks the
+	 * call chain to the owning frame. */
+	if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)
+	 || (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+		zval *zv = zend_hash_find(target_symbol_table, name);
+		if (zv && Z_TYPE_P(zv) == IS_INDIRECT) {
+			zend_unset_cv_clear_type_source(execute_data, Z_INDIRECT_P(zv));
+		}
+	}
 	zend_hash_del_ind(target_symbol_table, name);
 
 	if (IS_CV != IS_CONST) {
@@ -49801,6 +51746,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CV
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -49819,6 +51777,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CV
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -49907,7 +51870,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_MAKE_REF_SPEC
 	zval *op1 = EX_VAR(opline->op1.var);
 
 	if (IS_CV == IS_CV) {
+		zend_property_info *cv_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			cv_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+		}
 		if (UNEXPECTED(Z_TYPE_P(op1) == IS_UNDEF)) {
+			/* Forbid wrapping an uninitialized typed local into a reference (would
+			 * attach the type source to a reference holding an uninitialized slot). */
+			if (UNEXPECTED(cv_info != NULL)) {
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(cv_info);
+				UNDEF_RESULT();
+				HANDLE_EXCEPTION();
+			}
 			ZVAL_NEW_EMPTY_REF(op1);
 			Z_SET_REFCOUNT_P(op1, 2);
 			ZVAL_NULL(Z_REFVAL_P(op1));
@@ -49917,6 +51892,10 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_MAKE_REF_SPEC
 				Z_ADDREF_P(op1);
 			} else {
 				ZVAL_MAKE_REF_EX(op1, 2);
+				/* Newly created reference for a typed local: attach its type. */
+				if (UNEXPECTED(cv_info != NULL)) {
+					ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(op1), cv_info);
+				}
 			}
 			ZVAL_REF(EX_VAR(opline->result.var), Z_REF_P(op1));
 		}
@@ -52496,6 +54475,126 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_SPEC_C
 	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
 }
 
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_UNUSED_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(0)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(1)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OP_TYPED_SPEC_CV_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	zval *value;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
+	var_ptr = _get_zval_ptr_cv_BP_VAR_RW(opline->op1.var EXECUTE_DATA_CC);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_binary_assign_op_typed_ref(ref, value OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_binary_assign_op_typed_prop(info, var_ptr, value OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* ++/-- on a typed local CV. Emitted by the compiler in place of the plain
+ * ZEND_PRE_INC / ZEND_PRE_DEC / ZEND_POST_INC / ZEND_POST_DEC when op1 is a
+ * typed local. The increment/decrement is computed first (so int overflow can
+ * be detected) and then verified against the declared type exactly as for a
+ * typed property (zend_incdec_typed_prop): an int that overflows to float is
+ * rejected with a TypeError unless the type admits float, otherwise the value
+ * is coerced/verified honoring strict/weak mode. A typed reference is handled
+ * through its sources, matching the untyped helpers. The opcode numbers keep
+ * the increment/decrement parity required by ZEND_IS_INCREMENT() and the
+ * POST = PRE + 2 relationship used by zend_do_free()'s $i++ -> ++$i rewrite. */
 static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SPEC_CV_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
 {
 	USE_OPLINE
@@ -52504,6 +54603,18 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SP
 	zend_refcounted *garbage = NULL;
 
 	SAVE_OPLINE();
+	/* Forbid `$target = &$source` when the source is an uninitialized typed local:
+	 * the raw CV slot must be checked before the BP_VAR_W fetch below coerces its
+	 * IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op2.var EXECUTE_DATA_CC);
 	variable_ptr = EX_VAR(opline->op1.var);
 
@@ -52519,7 +54630,25 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_REF_SP
 		variable_ptr = zend_wrong_assign_to_variable_reference(
 			variable_ptr, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC);
 	} else {
-		zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		/* Typed local variables: if either side of `$target = &$source` is a typed
+		 * CV, route through a helper that enforces the type and attaches it as a
+		 * source on the resulting (shared) reference. Only IS_CV operands can be
+		 * typed locals. */
+		zend_property_info *target_info = NULL, *source_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			if (IS_CV == IS_CV) {
+				target_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			}
+			if (IS_CV == IS_CV) {
+				source_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op2.var)];
+			}
+		}
+		if (UNEXPECTED(target_info || source_info)) {
+			variable_ptr = zend_assign_to_typed_cv_reference(
+				target_info, source_info, variable_ptr, value_ptr, &garbage EXECUTE_DATA_CC);
+		} else {
+			zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		}
 	}
 
 	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
@@ -52546,7 +54675,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = EX_VAR(opline->op1.var);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -52584,7 +54736,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ASSIGN_OBJ_RE
 	container = EX_VAR(opline->op1.var);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -52911,11 +55086,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_ADD_ARRAY_ELE
 	SAVE_OPLINE();
 	if ((IS_CV == IS_VAR || IS_CV == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -53389,6 +55582,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CV
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -53407,6 +55613,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_FUNC_CCONV ZEND_YIELD_SPEC_CV
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -53929,7 +56140,26 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_STATIC_PROP
 		HANDLE_EXCEPTION();
 	}
 
+	/* `C::$s = &$cv` aliases the source CV (OP_DATA) into the static-property reference.
+	 * Forbid an uninitialized typed local: check the raw OP_DATA CV slot before the
+	 * BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. */
+	if ((opline+1)->op1_type == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = get_zval_ptr_ptr((opline+1)->op1_type, (opline+1)->op1, BP_VAR_W);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the static-property reference is type-checked. */
+	if ((opline+1)->op1_type == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, (opline+1)->op1_type, (opline+1)->op1.var, value_ptr);
+	}
 
 	if ((opline+1)->op1_type == IS_VAR && (opline->extended_value & ZEND_RETURNS_FUNCTION) && UNEXPECTED(!Z_ISREF_P(value_ptr))) {
 		if (UNEXPECTED(!zend_wrong_assign_to_variable_reference(prop, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC))) {
@@ -60653,11 +62883,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_CONST == IS_VAR || IS_CONST == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -61084,6 +63332,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CONST_C
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -61102,6 +63363,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CONST_C
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -63170,11 +65436,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_CONST == IS_VAR || IS_CONST == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -63495,6 +65779,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CONST_T
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -63513,6 +65810,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CONST_T
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -64032,11 +66334,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_CONST == IS_VAR || IS_CONST == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -64187,6 +66507,22 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_UNSET_VAR_SPEC_CON
 	}
 
 	target_symbol_table = zend_get_target_symbol_table(opline->extended_value EXECUTE_DATA_CC);
+	/* If the name resolves to a typed local that was promoted/aliased into a reference,
+	 * drop its type source before zend_hash_del_ind() dtors the reference (it does so
+	 * through the IS_INDIRECT entry, which never goes through ZEND_UNSET_CV).
+	 *
+	 * A local-table unset can only reach the current frame's CVs (gate on this frame having
+	 * typed locals). A global-table unset (`unset($GLOBALS['x'])`) reaches the script's main
+	 * frame, whose CVs may be typed even when the frame issuing the unset is not, so it must
+	 * be checked regardless of the current frame; zend_unset_cv_clear_type_source() walks the
+	 * call chain to the owning frame. */
+	if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)
+	 || (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+		zval *zv = zend_hash_find(target_symbol_table, name);
+		if (zv && Z_TYPE_P(zv) == IS_INDIRECT) {
+			zend_unset_cv_clear_type_source(execute_data, Z_INDIRECT_P(zv));
+		}
+	}
 	zend_hash_del_ind(target_symbol_table, name);
 
 	if (IS_CONST != IS_CONST) {
@@ -64278,6 +66614,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CONST_U
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -64296,6 +66645,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CONST_U
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -65687,11 +68041,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_CONST == IS_VAR || IS_CONST == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -66016,6 +68388,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CONST_C
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -66034,6 +68419,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CONST_C
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CONST == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -69128,6 +71518,22 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_UNSET_VAR_SPEC_TMP
 	}
 
 	target_symbol_table = zend_get_target_symbol_table(opline->extended_value EXECUTE_DATA_CC);
+	/* If the name resolves to a typed local that was promoted/aliased into a reference,
+	 * drop its type source before zend_hash_del_ind() dtors the reference (it does so
+	 * through the IS_INDIRECT entry, which never goes through ZEND_UNSET_CV).
+	 *
+	 * A local-table unset can only reach the current frame's CVs (gate on this frame having
+	 * typed locals). A global-table unset (`unset($GLOBALS['x'])`) reaches the script's main
+	 * frame, whose CVs may be typed even when the frame issuing the unset is not, so it must
+	 * be checked regardless of the current frame; zend_unset_cv_clear_type_source() walks the
+	 * call chain to the owning frame. */
+	if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)
+	 || (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+		zval *zv = zend_hash_find(target_symbol_table, name);
+		if (zv && Z_TYPE_P(zv) == IS_INDIRECT) {
+			zend_unset_cv_clear_type_source(execute_data, Z_INDIRECT_P(zv));
+		}
+	}
 	zend_hash_del_ind(target_symbol_table, name);
 
 	if ((IS_TMP_VAR|IS_VAR) != IS_CONST) {
@@ -71943,11 +74349,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_TMP_VAR == IS_VAR || IS_TMP_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -72313,6 +74737,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_TMP_CON
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -72331,6 +74768,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_TMP_CON
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -73479,11 +75921,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_TMP_VAR == IS_VAR || IS_TMP_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -73800,6 +76260,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_TMP_TMP
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -73818,6 +76291,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_TMP_TMP
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -74144,11 +76622,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_TMP_VAR == IS_VAR || IS_TMP_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -74394,6 +76890,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_TMP_UNU
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -74412,6 +76921,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_TMP_UNU
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -75243,11 +77757,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_TMP_VAR == IS_VAR || IS_TMP_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = zend_get_bad_ptr();
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -75568,6 +78100,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_TMP_CV_
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = zend_get_bad_ptr();
 
 				/* If a function call result is yielded and the function did
@@ -75586,6 +78131,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_TMP_CV_
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_TMP_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -75662,12 +78212,28 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_BIND_LEXICAL_SPEC_
 
 	closure = _get_zval_ptr_tmp(opline->op1.var EXECUTE_DATA_CC);
 	if (opline->extended_value & ZEND_BIND_REF) {
-		/* By-ref binding */
+		/* By-ref binding. `use (&$cv)` aliases the captured local into a reference shared
+		 * with the closure. When the captured variable is a typed local, forbid an
+		 * uninitialized one (check the raw CV slot before the BP_VAR_W fetch coerces
+		 * IS_UNDEF to IS_NULL) and, when its slot is freshly wrapped, attach its type so a
+		 * later write through the captured reference is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		var = _get_zval_ptr_cv_BP_VAR_W(opline->op2.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(var)) {
 			Z_ADDREF_P(var);
 		} else {
 			ZVAL_MAKE_REF_EX(var, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op2.var, Z_REF_P(var));
+			}
 		}
 	} else {
 		var = EX_VAR(opline->op2.var);
@@ -77935,7 +80501,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -77973,7 +80561,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -78304,11 +80914,32 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_REF_SPEC_VAR_
 		arg = ZEND_CALL_VAR(EX(call), opline->result.var);
 	}
 
+	/* Forbid passing an uninitialized typed local by reference: check the raw CV
+	 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+	 * slot has not been written yet and may hold a stale value from a prior call
+	 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+	 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+	 * data. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			ZVAL_UNDEF(arg);
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			HANDLE_EXCEPTION();
+		}
+	}
 	varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	if (Z_ISREF_P(varptr)) {
 		Z_ADDREF_P(varptr);
 	} else {
 		ZVAL_MAKE_REF_EX(varptr, 2);
+		/* Typed local passed by reference: attach its type to the new reference so
+		 * the callee cannot write through it in a type-violating way. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+		}
 	}
 	ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -78341,11 +80972,32 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_VAR_EX_SPEC_V
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -78584,11 +81236,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_VAR == IS_VAR || IS_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -78891,6 +81561,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_VAR_CON
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -78909,6 +81592,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_VAR_CON
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -80637,7 +83325,28 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -80674,7 +83383,28 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -80843,11 +83573,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_VAR == IS_VAR || IS_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -81149,6 +83897,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_VAR_TMP
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -81167,6 +83928,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_VAR_TMP
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -81243,6 +84009,18 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_VA
 	zend_refcounted *garbage = NULL;
 
 	SAVE_OPLINE();
+	/* Forbid `$target = &$source` when the source is an uninitialized typed local:
+	 * the raw CV slot must be checked before the BP_VAR_W fetch below coerces its
+	 * IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
 	value_ptr = _get_zval_ptr_ptr_var(opline->op2.var EXECUTE_DATA_CC);
 	variable_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
@@ -81258,7 +84036,25 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_VA
 		variable_ptr = zend_wrong_assign_to_variable_reference(
 			variable_ptr, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC);
 	} else {
-		zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		/* Typed local variables: if either side of `$target = &$source` is a typed
+		 * CV, route through a helper that enforces the type and attaches it as a
+		 * source on the resulting (shared) reference. Only IS_CV operands can be
+		 * typed locals. */
+		zend_property_info *target_info = NULL, *source_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			if (IS_VAR == IS_CV) {
+				target_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			}
+			if (IS_VAR == IS_CV) {
+				source_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op2.var)];
+			}
+		}
+		if (UNEXPECTED(target_info || source_info)) {
+			variable_ptr = zend_assign_to_typed_cv_reference(
+				target_info, source_info, variable_ptr, value_ptr, &garbage EXECUTE_DATA_CC);
+		} else {
+			zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		}
 	}
 
 	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
@@ -82342,11 +85138,32 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_REF_SPEC_VAR_
 		arg = ZEND_CALL_VAR(EX(call), opline->result.var);
 	}
 
+	/* Forbid passing an uninitialized typed local by reference: check the raw CV
+	 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+	 * slot has not been written yet and may hold a stale value from a prior call
+	 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+	 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+	 * data. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			ZVAL_UNDEF(arg);
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			HANDLE_EXCEPTION();
+		}
+	}
 	varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	if (Z_ISREF_P(varptr)) {
 		Z_ADDREF_P(varptr);
 	} else {
 		ZVAL_MAKE_REF_EX(varptr, 2);
+		/* Typed local passed by reference: attach its type to the new reference so
+		 * the callee cannot write through it in a type-violating way. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+		}
 	}
 	ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -82379,11 +85196,32 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_VAR_EX_SPEC_V
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -82445,11 +85283,32 @@ static ZEND_VM_HOT ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_V
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -82614,11 +85473,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_VAR == IS_VAR || IS_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -82789,6 +85666,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_VAR_UNU
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -82807,6 +85697,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_VAR_UNU
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -82881,7 +85776,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_MAKE_REF_SPEC_VAR_
 	zval *op1 = EX_VAR(opline->op1.var);
 
 	if (IS_VAR == IS_CV) {
+		zend_property_info *cv_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			cv_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+		}
 		if (UNEXPECTED(Z_TYPE_P(op1) == IS_UNDEF)) {
+			/* Forbid wrapping an uninitialized typed local into a reference (would
+			 * attach the type source to a reference holding an uninitialized slot). */
+			if (UNEXPECTED(cv_info != NULL)) {
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(cv_info);
+				UNDEF_RESULT();
+				HANDLE_EXCEPTION();
+			}
 			ZVAL_NEW_EMPTY_REF(op1);
 			Z_SET_REFCOUNT_P(op1, 2);
 			ZVAL_NULL(Z_REFVAL_P(op1));
@@ -82891,6 +85798,10 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_MAKE_REF_SPEC_VAR_
 				Z_ADDREF_P(op1);
 			} else {
 				ZVAL_MAKE_REF_EX(op1, 2);
+				/* Newly created reference for a typed local: attach its type. */
+				if (UNEXPECTED(cv_info != NULL)) {
+					ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(op1), cv_info);
+				}
 			}
 			ZVAL_REF(EX_VAR(opline->result.var), Z_REF_P(op1));
 		}
@@ -84468,6 +87379,18 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_VA
 	zend_refcounted *garbage = NULL;
 
 	SAVE_OPLINE();
+	/* Forbid `$target = &$source` when the source is an uninitialized typed local:
+	 * the raw CV slot must be checked before the BP_VAR_W fetch below coerces its
+	 * IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op2.var EXECUTE_DATA_CC);
 	variable_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
@@ -84483,7 +87406,25 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_VA
 		variable_ptr = zend_wrong_assign_to_variable_reference(
 			variable_ptr, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC);
 	} else {
-		zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		/* Typed local variables: if either side of `$target = &$source` is a typed
+		 * CV, route through a helper that enforces the type and attaches it as a
+		 * source on the resulting (shared) reference. Only IS_CV operands can be
+		 * typed locals. */
+		zend_property_info *target_info = NULL, *source_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			if (IS_VAR == IS_CV) {
+				target_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			}
+			if (IS_CV == IS_CV) {
+				source_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op2.var)];
+			}
+		}
+		if (UNEXPECTED(target_info || source_info)) {
+			variable_ptr = zend_assign_to_typed_cv_reference(
+				target_info, source_info, variable_ptr, value_ptr, &garbage EXECUTE_DATA_CC);
+		} else {
+			zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		}
 	}
 
 	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
@@ -84509,7 +87450,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -84547,7 +87510,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_VAR == IS_UNUSED) {
@@ -84722,11 +87707,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_VAR == IS_VAR || IS_VAR == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 		zval_ptr_dtor_nogc(EX_VAR(opline->op1.var));
 	} else {
@@ -85029,6 +88032,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_VAR_CV_
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_ptr_var(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -85047,6 +88063,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_VAR_CV_
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -86479,7 +89500,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = &EX(This);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -86517,7 +89561,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = &EX(This);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -87272,6 +90339,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_UNUSED_
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = NULL;
 
 				/* If a function call result is yielded and the function did
@@ -87290,6 +90370,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_UNUSED_
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -88574,7 +91659,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = &EX(This);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -88611,7 +91718,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = &EX(This);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -89162,6 +92291,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_UNUSED_
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = NULL;
 
 				/* If a function call result is yielded and the function did
@@ -89180,6 +92322,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_UNUSED_
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -89711,6 +92858,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_UNUSED_
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = NULL;
 
 				/* If a function call result is yielded and the function did
@@ -89729,6 +92889,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_UNUSED_
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -91149,7 +94314,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = &EX(This);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -91187,7 +94375,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = &EX(This);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_UNUSED == IS_UNUSED) {
@@ -91751,6 +94962,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_UNUSED_
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = NULL;
 
 				/* If a function call result is yielded and the function did
@@ -91769,6 +94993,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_UNUSED_
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_UNUSED == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -92124,6 +95353,138 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ECHO_SPEC_CV_TAILC
 		}
 		zend_string_release_ex(str, 0);
 	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_PRE_INC_TYPED_SPEC_CV_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	var_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	if (IS_CV == IS_CV && UNEXPECTED(Z_TYPE_P(var_ptr) == IS_UNDEF)) {
+		ZVAL_UNDEFINED_OP1();
+		ZVAL_NULL(var_ptr);
+	}
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_incdec_typed_ref(ref, NULL OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_incdec_typed_prop(info, var_ptr, NULL OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_PRE_DEC_TYPED_SPEC_CV_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	var_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	if (IS_CV == IS_CV && UNEXPECTED(Z_TYPE_P(var_ptr) == IS_UNDEF)) {
+		ZVAL_UNDEFINED_OP1();
+		ZVAL_NULL(var_ptr);
+	}
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_incdec_typed_ref(ref, NULL OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_incdec_typed_prop(info, var_ptr, NULL OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_POST_INC_TYPED_SPEC_CV_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	var_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	if (IS_CV == IS_CV && UNEXPECTED(Z_TYPE_P(var_ptr) == IS_UNDEF)) {
+		ZVAL_UNDEFINED_OP1();
+		ZVAL_NULL(var_ptr);
+	}
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_incdec_typed_ref(ref, EX_VAR(opline->result.var) OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_incdec_typed_prop(info, var_ptr, EX_VAR(opline->result.var) OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_POST_DEC_TYPED_SPEC_CV_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	var_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	if (IS_CV == IS_CV && UNEXPECTED(Z_TYPE_P(var_ptr) == IS_UNDEF)) {
+		ZVAL_UNDEFINED_OP1();
+		ZVAL_NULL(var_ptr);
+	}
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_incdec_typed_ref(ref, EX_VAR(opline->result.var) OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_incdec_typed_prop(info, var_ptr, EX_VAR(opline->result.var) OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
 
 
 	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
@@ -96041,6 +99402,126 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_SPEC_CV_CON
 	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
 }
 
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_UNUSED_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = RT_CONSTANT(opline, opline->op2);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(0)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_USED_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = RT_CONSTANT(opline, opline->op2);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(1)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OP_TYPED_SPEC_CV_CONST_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	zval *value;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	value = RT_CONSTANT(opline, opline->op2);
+	var_ptr = _get_zval_ptr_cv_BP_VAR_RW(opline->op1.var EXECUTE_DATA_CC);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_binary_assign_op_typed_ref(ref, value OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_binary_assign_op_typed_prop(info, var_ptr, value OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* ++/-- on a typed local CV. Emitted by the compiler in place of the plain
+ * ZEND_PRE_INC / ZEND_PRE_DEC / ZEND_POST_INC / ZEND_POST_DEC when op1 is a
+ * typed local. The increment/decrement is computed first (so int overflow can
+ * be detected) and then verified against the declared type exactly as for a
+ * typed property (zend_incdec_typed_prop): an int that overflows to float is
+ * rejected with a TypeError unless the type admits float, otherwise the value
+ * is coerced/verified honoring strict/weak mode. A typed reference is handled
+ * through its sources, matching the untyped helpers. The opcode numbers keep
+ * the increment/decrement parity required by ZEND_IS_INCREMENT() and the
+ * POST = PRE + 2 relationship used by zend_do_free()'s $i++ -> ++$i rewrite. */
 static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPEC_CV_CONST_OP_DATA_VAR_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
 {
 	USE_OPLINE
@@ -96051,7 +99532,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = EX_VAR(opline->op1.var);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -96089,7 +99593,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = EX_VAR(opline->op1.var);
 	property = RT_CONSTANT(opline, opline->op2);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -96475,11 +100002,33 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_REF_SPEC_CV_C
 		arg = ZEND_CALL_VAR(EX(call), opline->result.var);
 	}
 
+	/* Forbid passing an uninitialized typed local by reference: check the raw CV
+	 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+	 * slot has not been written yet and may hold a stale value from a prior call
+	 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+	 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+	 * data. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			ZVAL_UNDEF(arg);
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			HANDLE_EXCEPTION();
+		}
+	}
 	varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 	if (Z_ISREF_P(varptr)) {
 		Z_ADDREF_P(varptr);
 	} else {
 		ZVAL_MAKE_REF_EX(varptr, 2);
+		/* Typed local passed by reference: attach its type to the new reference so
+		 * the callee cannot write through it in a type-violating way. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+		}
 	}
 	ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -96513,11 +100062,33 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_VAR_EX_SPEC_C
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -96562,11 +100133,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_CV == IS_VAR || IS_CV == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -97087,6 +100676,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CV_CONS
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -97105,6 +100707,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CV_CONS
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -97221,6 +100828,20 @@ check_indirect:
 			}
 		}
 	}
+
+	/* `global $x` binds the imported global into the function-local CV by reference: the slot
+	 * is wrapped in a reference below and that reference is shared with the local. If the global
+	 * resolved to a file-scope typed local (its owning frame's cv_types[idx] != NULL), the bind
+	 * would otherwise share a *plain* reference and writes through the local alias would bypass
+	 * the declared type. Promote the slot to a typed reference here -- attaching the local's
+	 * synthesized type as a source -- so the existing Z_ISREF_P branch below shares that typed
+	 * reference and every write routes through zend_verify_ref_assignable_zval (coerce in weak
+	 * mode, throw in strict / on a non-coercible value), matching the static, $$name and
+	 * $GLOBALS paths. The slot was NULL-initialized above if it was IS_UNDEF, so the defined-CV
+	 * promotion covers both an assigned and a freshly-imported undefined global. No-op for an
+	 * untyped CV, a non-frame slot, or a slot already a (typed) reference; idempotent. The owning
+	 * frame is the script's main frame, walked via prev_execute_data. */
+	zend_promote_defined_cv_to_typed_ref(execute_data, value);
 
 	if (UNEXPECTED(!Z_ISREF_P(value))) {
 		ZVAL_MAKE_REF_EX(value, 2);
@@ -99858,6 +103479,126 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_SPEC_CV_TMP
 	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
 }
 
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_UNUSED_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(0)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_USED_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(1)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OP_TYPED_SPEC_CV_TMP_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	zval *value;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
+	var_ptr = _get_zval_ptr_cv_BP_VAR_RW(opline->op1.var EXECUTE_DATA_CC);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_binary_assign_op_typed_ref(ref, value OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_binary_assign_op_typed_prop(info, var_ptr, value OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* ++/-- on a typed local CV. Emitted by the compiler in place of the plain
+ * ZEND_PRE_INC / ZEND_PRE_DEC / ZEND_POST_INC / ZEND_POST_DEC when op1 is a
+ * typed local. The increment/decrement is computed first (so int overflow can
+ * be detected) and then verified against the declared type exactly as for a
+ * typed property (zend_incdec_typed_prop): an int that overflows to float is
+ * rejected with a TypeError unless the type admits float, otherwise the value
+ * is coerced/verified honoring strict/weak mode. A typed reference is handled
+ * through its sources, matching the untyped helpers. The opcode numbers keep
+ * the increment/decrement parity required by ZEND_IS_INCREMENT() and the
+ * POST = PRE + 2 relationship used by zend_do_free()'s $i++ -> ++$i rewrite. */
 static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPEC_CV_TMP_OP_DATA_VAR_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
 {
 	USE_OPLINE
@@ -99868,7 +103609,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = EX_VAR(opline->op1.var);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -99905,7 +103668,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = EX_VAR(opline->op1.var);
 	property = _get_zval_ptr_tmp(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -100225,11 +104010,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_CV == IS_VAR || IS_CV == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -100699,6 +104502,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CV_TMP_
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -100717,6 +104533,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CV_TMP_
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -100786,6 +104607,82 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CV_TMP_
 	ZEND_VM_RETURN();
 }
 
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_UNUSED_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_var(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(0)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_USED_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_var(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(1)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+	zval_ptr_dtor_nogc(EX_VAR(opline->op2.var));
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
 static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_CV_VAR_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
 {
 	USE_OPLINE
@@ -100794,6 +104691,18 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_CV
 	zend_refcounted *garbage = NULL;
 
 	SAVE_OPLINE();
+	/* Forbid `$target = &$source` when the source is an uninitialized typed local:
+	 * the raw CV slot must be checked before the BP_VAR_W fetch below coerces its
+	 * IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
 	value_ptr = _get_zval_ptr_ptr_var(opline->op2.var EXECUTE_DATA_CC);
 	variable_ptr = EX_VAR(opline->op1.var);
 
@@ -100809,7 +104718,25 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_CV
 		variable_ptr = zend_wrong_assign_to_variable_reference(
 			variable_ptr, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC);
 	} else {
-		zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		/* Typed local variables: if either side of `$target = &$source` is a typed
+		 * CV, route through a helper that enforces the type and attaches it as a
+		 * source on the resulting (shared) reference. Only IS_CV operands can be
+		 * typed locals. */
+		zend_property_info *target_info = NULL, *source_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			if (IS_CV == IS_CV) {
+				target_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			}
+			if (IS_VAR == IS_CV) {
+				source_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op2.var)];
+			}
+		}
+		if (UNEXPECTED(target_info || source_info)) {
+			variable_ptr = zend_assign_to_typed_cv_reference(
+				target_info, source_info, variable_ptr, value_ptr, &garbage EXECUTE_DATA_CC);
+		} else {
+			zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		}
 	}
 
 	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
@@ -101677,11 +105604,33 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_REF_SPEC_CV_U
 		arg = ZEND_CALL_VAR(EX(call), opline->result.var);
 	}
 
+	/* Forbid passing an uninitialized typed local by reference: check the raw CV
+	 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+	 * slot has not been written yet and may hold a stale value from a prior call
+	 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+	 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+	 * data. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			ZVAL_UNDEF(arg);
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+			HANDLE_EXCEPTION();
+		}
+	}
 	varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 	if (Z_ISREF_P(varptr)) {
 		Z_ADDREF_P(varptr);
 	} else {
 		ZVAL_MAKE_REF_EX(varptr, 2);
+		/* Typed local passed by reference: attach its type to the new reference so
+		 * the callee cannot write through it in a type-violating way. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+		}
 	}
 	ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -101715,11 +105664,33 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_VAR_EX_SPEC_C
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -101782,11 +105753,33 @@ static ZEND_VM_HOT ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_SEND_V
 		}
 	} else if (ARG_SHOULD_BE_SENT_BY_REF(EX(call)->func, arg_num)) {
 send_var_by_ref:
+		/* Forbid passing an uninitialized typed local by reference: check the raw CV
+		 * slot before the BP_VAR_W fetch below coerces its IS_UNDEF to IS_NULL. The arg
+		 * slot has not been written yet and may hold a stale value from a prior call
+		 * that reused this stack frame; mark it UNDEF before unwinding so the matching
+		 * cleanup_unfinished_calls() (which frees args 1..op2.num) does not dtor stale
+		 * data. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				ZVAL_UNDEF(arg);
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+				HANDLE_EXCEPTION();
+			}
+		}
 		varptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(varptr)) {
 			Z_ADDREF_P(varptr);
 		} else {
 			ZVAL_MAKE_REF_EX(varptr, 2);
+			/* Typed local passed by reference: enforce the type on the new reference. */
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(varptr));
+			}
 		}
 		ZVAL_REF(arg, Z_REF_P(varptr));
 
@@ -101831,11 +105824,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_CV == IS_VAR || IS_CV == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -101965,6 +105976,21 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_UNSET_CV_SPEC_CV_U
 	if (Z_REFCOUNTED_P(var)) {
 		zend_refcounted *garbage = Z_COUNTED_P(var);
 
+		/* A typed local that was wrapped into a reference (aliased by `&$cv`, passed by
+		 * reference, or promoted for a by-name write) carries its synthesized type as a
+		 * source on that reference. Unsetting the CV may release the reference, so remove
+		 * the source first, mirroring the typed-property unset path and frame teardown. This
+		 * keeps the ADD/DEL bookkeeping balanced one-per-CV-slot (the teardown DEL sites skip
+		 * an UNDEF slot). */
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)
+		 && UNEXPECTED(Z_ISREF_P(var))
+		 && ZEND_REF_HAS_TYPE_SOURCES(Z_REF_P(var))) {
+			zend_property_info *cv_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			if (cv_info != NULL) {
+				ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(var), cv_info);
+			}
+		}
+
 		ZVAL_UNDEF(var);
 		SAVE_OPLINE();
 		GC_DTOR(garbage);
@@ -102004,6 +106030,22 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_UNSET_VAR_SPEC_CV_
 	}
 
 	target_symbol_table = zend_get_target_symbol_table(opline->extended_value EXECUTE_DATA_CC);
+	/* If the name resolves to a typed local that was promoted/aliased into a reference,
+	 * drop its type source before zend_hash_del_ind() dtors the reference (it does so
+	 * through the IS_INDIRECT entry, which never goes through ZEND_UNSET_CV).
+	 *
+	 * A local-table unset can only reach the current frame's CVs (gate on this frame having
+	 * typed locals). A global-table unset (`unset($GLOBALS['x'])`) reaches the script's main
+	 * frame, whose CVs may be typed even when the frame issuing the unset is not, so it must
+	 * be checked regardless of the current frame; zend_unset_cv_clear_type_source() walks the
+	 * call chain to the owning frame. */
+	if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)
+	 || (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+		zval *zv = zend_hash_find(target_symbol_table, name);
+		if (zv && Z_TYPE_P(zv) == IS_INDIRECT) {
+			zend_unset_cv_clear_type_source(execute_data, Z_INDIRECT_P(zv));
+		}
+	}
 	zend_hash_del_ind(target_symbol_table, name);
 
 	if (IS_CV != IS_CONST) {
@@ -102186,6 +106228,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CV_UNUS
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -102204,6 +106259,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CV_UNUS
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -102292,7 +106352,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_MAKE_REF_SPEC_CV_U
 	zval *op1 = EX_VAR(opline->op1.var);
 
 	if (IS_CV == IS_CV) {
+		zend_property_info *cv_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			cv_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+		}
 		if (UNEXPECTED(Z_TYPE_P(op1) == IS_UNDEF)) {
+			/* Forbid wrapping an uninitialized typed local into a reference (would
+			 * attach the type source to a reference holding an uninitialized slot). */
+			if (UNEXPECTED(cv_info != NULL)) {
+				SAVE_OPLINE();
+				zend_throw_access_uninit_typed_local_by_ref_error(cv_info);
+				UNDEF_RESULT();
+				HANDLE_EXCEPTION();
+			}
 			ZVAL_NEW_EMPTY_REF(op1);
 			Z_SET_REFCOUNT_P(op1, 2);
 			ZVAL_NULL(Z_REFVAL_P(op1));
@@ -102302,6 +106374,10 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_MAKE_REF_SPEC_CV_U
 				Z_ADDREF_P(op1);
 			} else {
 				ZVAL_MAKE_REF_EX(op1, 2);
+				/* Newly created reference for a typed local: attach its type. */
+				if (UNEXPECTED(cv_info != NULL)) {
+					ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(op1), cv_info);
+				}
 			}
 			ZVAL_REF(EX_VAR(opline->result.var), Z_REF_P(op1));
 		}
@@ -104881,6 +108957,126 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_SPEC_CV_CV_
 	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
 }
 
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_UNUSED_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(0)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_USED_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *value;
+	zval *variable_ptr;
+	const zend_property_info *info;
+	zend_refcounted *garbage = NULL;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
+	variable_ptr = EX_VAR(opline->op1.var);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	/* zend_assign_to_typed_cv() copies the value into a separated tmp before any
+	 * coercion, so a CONST literal RHS is never mutated in place. It consumes the
+	 * tmp (IS_TMP_VAR) but NOT the source operand, so we free op2 ourselves below. */
+	value = zend_assign_to_typed_cv(info, info->name, variable_ptr, value, &garbage EXECUTE_DATA_CC);
+
+	if (UNEXPECTED(1)) {
+		ZVAL_COPY(EX_VAR(opline->result.var), value);
+	}
+
+	if (garbage) {
+		GC_DTOR_NO_REF(garbage);
+	}
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* Compound assignment (`+= -= .= ...`) to a typed local CV. Emitted by the
+ * compiler in place of ZEND_ASSIGN_OP when op1 is a typed local (cv_types[idx]
+ * is set), mirroring the ZEND_ASSIGN_TYPED choice. Behaves exactly like the
+ * typed-property case in ZEND_ASSIGN_OBJ_OP: a typed reference enforces the
+ * type through its sources, and a plain typed-CV value is routed through
+ * zend_binary_assign_op_typed_prop (compute via zend_binary_op, then verify /
+ * coerce against the declared scalar type honoring strict/weak mode). The
+ * untyped ASSIGN_OP hot path is left untouched. */
+static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OP_TYPED_SPEC_CV_CV_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
+{
+	USE_OPLINE
+	zval *var_ptr;
+	zval *value;
+	const zend_property_info *info;
+
+	SAVE_OPLINE();
+	value = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
+	var_ptr = _get_zval_ptr_cv_BP_VAR_RW(opline->op1.var EXECUTE_DATA_CC);
+	info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+
+	do {
+		if (UNEXPECTED(Z_TYPE_P(var_ptr) == IS_REFERENCE)) {
+			zend_reference *ref = Z_REF_P(var_ptr);
+			var_ptr = Z_REFVAL_P(var_ptr);
+			if (UNEXPECTED(ZEND_REF_HAS_TYPE_SOURCES(ref))) {
+				zend_binary_assign_op_typed_ref(ref, value OPLINE_CC EXECUTE_DATA_CC);
+				break;
+			}
+		}
+		zend_binary_assign_op_typed_prop(info, var_ptr, value OPLINE_CC EXECUTE_DATA_CC);
+	} while (0);
+
+	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
+		ZVAL_COPY(EX_VAR(opline->result.var), var_ptr);
+	}
+
+
+
+
+	ZEND_VM_NEXT_OPCODE_CHECK_EXCEPTION();
+}
+
+/* ++/-- on a typed local CV. Emitted by the compiler in place of the plain
+ * ZEND_PRE_INC / ZEND_PRE_DEC / ZEND_POST_INC / ZEND_POST_DEC when op1 is a
+ * typed local. The increment/decrement is computed first (so int overflow can
+ * be detected) and then verified against the declared type exactly as for a
+ * typed property (zend_incdec_typed_prop): an int that overflows to float is
+ * rejected with a TypeError unless the type admits float, otherwise the value
+ * is coerced/verified honoring strict/weak mode. A typed reference is handled
+ * through its sources, matching the untyped helpers. The opcode numbers keep
+ * the increment/decrement parity required by ZEND_IS_INCREMENT() and the
+ * POST = PRE + 2 relationship used by zend_do_free()'s $i++ -> ++$i rewrite. */
 static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_CV_CV_TAILCALL_HANDLER(ZEND_OPCODE_HANDLER_ARGS)
 {
 	USE_OPLINE
@@ -104889,6 +109085,18 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_CV
 	zend_refcounted *garbage = NULL;
 
 	SAVE_OPLINE();
+	/* Forbid `$target = &$source` when the source is an uninitialized typed local:
+	 * the raw CV slot must be checked before the BP_VAR_W fetch below coerces its
+	 * IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, opline->op2.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op2.var EXECUTE_DATA_CC);
 	variable_ptr = EX_VAR(opline->op1.var);
 
@@ -104904,7 +109112,25 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_REF_SPEC_CV
 		variable_ptr = zend_wrong_assign_to_variable_reference(
 			variable_ptr, value_ptr, &garbage OPLINE_CC EXECUTE_DATA_CC);
 	} else {
-		zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		/* Typed local variables: if either side of `$target = &$source` is a typed
+		 * CV, route through a helper that enforces the type and attaches it as a
+		 * source on the resulting (shared) reference. Only IS_CV operands can be
+		 * typed locals. */
+		zend_property_info *target_info = NULL, *source_info = NULL;
+		if (UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			if (IS_CV == IS_CV) {
+				target_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op1.var)];
+			}
+			if (IS_CV == IS_CV) {
+				source_info = EX(func)->op_array.cv_types[EX_VAR_TO_NUM(opline->op2.var)];
+			}
+		}
+		if (UNEXPECTED(target_info || source_info)) {
+			variable_ptr = zend_assign_to_typed_cv_reference(
+				target_info, source_info, variable_ptr, value_ptr, &garbage EXECUTE_DATA_CC);
+		} else {
+			zend_assign_to_variable_reference(variable_ptr, value_ptr, &garbage);
+		}
 	}
 
 	if (UNEXPECTED(RETURN_VALUE_USED(opline))) {
@@ -104931,7 +109157,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = EX_VAR(opline->op1.var);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_ptr_var((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_VAR == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_VAR, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -104969,7 +109218,30 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ASSIGN_OBJ_REF_SPE
 	container = EX_VAR(opline->op1.var);
 	property = _get_zval_ptr_cv_BP_VAR_R(opline->op2.var EXECUTE_DATA_CC);
 
+	/* `$o->p = &$cv` aliases the source CV (OP_DATA) into the property reference. Forbid an
+	 * uninitialized typed local: check the raw OP_DATA CV slot before the BP_VAR_W fetch
+	 * below coerces its IS_UNDEF to IS_NULL. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+			&EX(func)->op_array, (opline+1)->op1.var EXECUTE_DATA_CC);
+		if (UNEXPECTED(uninit_info != NULL)) {
+			zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+
+
+
+
+			UNDEF_RESULT();
+			HANDLE_EXCEPTION();
+		}
+	}
+
 	value_ptr = _get_zval_ptr_cv_BP_VAR_W((opline+1)->op1.var EXECUTE_DATA_CC);
+
+	/* When the source is a typed local, wrap it and attach its type before the alias is
+	 * formed, so a later write through the property reference is type-checked. */
+	if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+		zend_attach_cv_source_for_property_ref(&EX(func)->op_array, IS_CV, (opline+1)->op1.var, value_ptr);
+	}
 
 	if (1) {
 		if (IS_CV == IS_UNUSED) {
@@ -105296,11 +109568,29 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_ADD_ARRAY_ELEMENT_
 	SAVE_OPLINE();
 	if ((IS_CV == IS_VAR || IS_CV == IS_CV) &&
 	    UNEXPECTED(opline->extended_value & ZEND_ARRAY_ELEMENT_REF)) {
+		/* `$arr = [&$cv]` wraps the typed local into a reference held by the array
+		 * element. Forbid an uninitialized typed local (check the raw CV slot before
+		 * the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL) and, when the slot is freshly
+		 * wrapped, attach its type so a later write through the element is type-checked. */
+		if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+			zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+				&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+			if (UNEXPECTED(uninit_info != NULL)) {
+				/* OP1 is a CV (nothing to free) and OP2 (the key) has not been fetched
+				 * yet; leave the partially built result array in place for the unwinder
+				 * to free, matching the other exception exits in this handler. */
+				zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+				HANDLE_EXCEPTION();
+			}
+		}
 		expr_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 		if (Z_ISREF_P(expr_ptr)) {
 			Z_ADDREF_P(expr_ptr);
 		} else {
 			ZVAL_MAKE_REF_EX(expr_ptr, 2);
+			if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+				zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(expr_ptr));
+			}
 		}
 
 
@@ -105774,6 +110064,19 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CV_CV_T
 					}
 				}
 			} else {
+				/* `yield $cv` in a by-reference generator wraps the typed local into a
+				 * reference held by the generator (reachable for a type-violating write via
+				 * `foreach ($gen as &$v)`). Forbid an uninitialized typed local (check the
+				 * raw CV slot before the BP_VAR_W fetch coerces IS_UNDEF to IS_NULL). */
+				if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+					zend_property_info *uninit_info = zend_cv_uninitialized_typed_ref_source(
+						&EX(func)->op_array, opline->op1.var EXECUTE_DATA_CC);
+					if (UNEXPECTED(uninit_info != NULL)) {
+						zend_throw_access_uninit_typed_local_by_ref_error(uninit_info);
+						HANDLE_EXCEPTION();
+					}
+				}
+
 				zval *value_ptr = _get_zval_ptr_cv_BP_VAR_W(opline->op1.var EXECUTE_DATA_CC);
 
 				/* If a function call result is yielded and the function did
@@ -105792,6 +110095,11 @@ static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV ZEND_YIELD_SPEC_CV_CV_T
 						Z_ADDREF_P(value_ptr);
 					} else {
 						ZVAL_MAKE_REF_EX(value_ptr, 2);
+						/* Newly created reference for a typed local: attach its type so a
+						 * write through the yielded reference is type-checked. */
+						if (IS_CV == IS_CV && UNEXPECTED(EX(func)->op_array.cv_types != NULL)) {
+							zend_attach_cv_type_source_ex(&EX(func)->op_array, opline->op1.var, Z_REF_P(value_ptr));
+						}
 					}
 					ZVAL_REF(&generator->value, Z_REF_P(value_ptr));
 				} while (0);
@@ -106429,18 +110737,56 @@ fetch_this:
 				goto fetch_this;
 			}
 			if (type == BP_VAR_W) {
-				ZVAL_NULL(retval);
+				/* A by-name write ($$name = ...) into a still-UNDEF slot. If the slot is a
+				 * typed CV, promote it to a typed reference so the ASSIGN that follows is
+				 * type-checked (closes the uninitialized-first-write hole); the slot is then
+				 * IS_REFERENCE and must not be reset to NULL. Otherwise initialise to NULL as
+				 * before. */
+				zend_promote_undef_cv_to_typed_ref(execute_data, retval);
+				if (Z_TYPE_P(retval) != IS_REFERENCE) {
+					ZVAL_NULL(retval);
+				}
 			} else if (type == BP_VAR_IS || type == BP_VAR_UNSET) {
 				retval = &EG(uninitialized_zval);
 			} else {
 				zend_error_unchecked(E_WARNING, "Undefined %svariable $%S",
 					(opline->extended_value & ZEND_FETCH_GLOBAL ? "global " : ""), name);
 				if (type == BP_VAR_RW && !EG(exception)) {
-					ZVAL_NULL(retval);
+					/* A by-name compound assign / inc-dec ($$name .= ..., $$name++)
+					 * into a still-UNDEF slot. Mirror the BP_VAR_W path, but use the
+					 * RW variant: the slot is first NULL-initialized (as the static
+					 * typed-CV RW path does after the undefined-variable warning) so
+					 * the binary op / increment runs on NULL, and if the slot is a
+					 * typed CV that NULL is wrapped in a typed reference so the
+					 * compound/inc-dec store that follows is type-checked (closes the
+					 * uninitialized-first-write hole on the RW fetch path); the slot
+					 * is then IS_REFERENCE and must not be reset. Untyped/non-frame
+					 * slots fall through to a bare NULL as before. */
+					zend_promote_undef_cv_to_typed_ref_rw(execute_data, retval);
+					if (Z_TYPE_P(retval) != IS_REFERENCE) {
+						ZVAL_NULL(retval);
+					}
 				} else {
 					retval = &EG(uninitialized_zval);
 				}
 			}
+		} else if ((type == BP_VAR_W || type == BP_VAR_RW)
+				&& (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+			/* A by-name WRITE through the GLOBAL symbol table resolved to a DEFINED CV slot.
+			 * Two callers reach here with a DEFINED slot:
+			 *   - $GLOBALS['name'] = ... / += ... / ++  (ZEND_FETCH_GLOBAL), and
+			 *   - the dynamic `global $$name` slow path: FETCH_W with ZEND_FETCH_GLOBAL_LOCK
+			 *     returns this INDIRECT, and the ASSIGN_REF that follows binds the global into
+			 *     the function-local CV by reference.
+			 * Either way the GLOBAL fetch returns &EG(symbol_table) without promoting typed CVs
+			 * (unlike the $$name/local path, which promotes via zend_get_target_symbol_table),
+			 * so a file-scope typed local is still a plain value here -- the ASSIGN/ASSIGN_OP/INC
+			 * ($GLOBALS) or the ASSIGN_REF bind (global $$name) that follows would share/overwrite
+			 * it unchecked, bypassing its declared type. Promote it to a typed reference so that
+			 * write (or the reference shared by the bind) is type-checked, matching the static,
+			 * $$name and $GLOBALS paths. No-op for an untyped CV, a non-frame slot, or a slot
+			 * already a reference. The UNDEF case is handled by the branch above. */
+			zend_promote_defined_cv_to_typed_ref(execute_data, retval);
 		}
 	}
 
@@ -106531,18 +110877,56 @@ fetch_this:
 				goto fetch_this;
 			}
 			if (type == BP_VAR_W) {
-				ZVAL_NULL(retval);
+				/* A by-name write ($$name = ...) into a still-UNDEF slot. If the slot is a
+				 * typed CV, promote it to a typed reference so the ASSIGN that follows is
+				 * type-checked (closes the uninitialized-first-write hole); the slot is then
+				 * IS_REFERENCE and must not be reset to NULL. Otherwise initialise to NULL as
+				 * before. */
+				zend_promote_undef_cv_to_typed_ref(execute_data, retval);
+				if (Z_TYPE_P(retval) != IS_REFERENCE) {
+					ZVAL_NULL(retval);
+				}
 			} else if (type == BP_VAR_IS || type == BP_VAR_UNSET) {
 				retval = &EG(uninitialized_zval);
 			} else {
 				zend_error_unchecked(E_WARNING, "Undefined %svariable $%S",
 					(opline->extended_value & ZEND_FETCH_GLOBAL ? "global " : ""), name);
 				if (type == BP_VAR_RW && !EG(exception)) {
-					ZVAL_NULL(retval);
+					/* A by-name compound assign / inc-dec ($$name .= ..., $$name++)
+					 * into a still-UNDEF slot. Mirror the BP_VAR_W path, but use the
+					 * RW variant: the slot is first NULL-initialized (as the static
+					 * typed-CV RW path does after the undefined-variable warning) so
+					 * the binary op / increment runs on NULL, and if the slot is a
+					 * typed CV that NULL is wrapped in a typed reference so the
+					 * compound/inc-dec store that follows is type-checked (closes the
+					 * uninitialized-first-write hole on the RW fetch path); the slot
+					 * is then IS_REFERENCE and must not be reset. Untyped/non-frame
+					 * slots fall through to a bare NULL as before. */
+					zend_promote_undef_cv_to_typed_ref_rw(execute_data, retval);
+					if (Z_TYPE_P(retval) != IS_REFERENCE) {
+						ZVAL_NULL(retval);
+					}
 				} else {
 					retval = &EG(uninitialized_zval);
 				}
 			}
+		} else if ((type == BP_VAR_W || type == BP_VAR_RW)
+				&& (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+			/* A by-name WRITE through the GLOBAL symbol table resolved to a DEFINED CV slot.
+			 * Two callers reach here with a DEFINED slot:
+			 *   - $GLOBALS['name'] = ... / += ... / ++  (ZEND_FETCH_GLOBAL), and
+			 *   - the dynamic `global $$name` slow path: FETCH_W with ZEND_FETCH_GLOBAL_LOCK
+			 *     returns this INDIRECT, and the ASSIGN_REF that follows binds the global into
+			 *     the function-local CV by reference.
+			 * Either way the GLOBAL fetch returns &EG(symbol_table) without promoting typed CVs
+			 * (unlike the $$name/local path, which promotes via zend_get_target_symbol_table),
+			 * so a file-scope typed local is still a plain value here -- the ASSIGN/ASSIGN_OP/INC
+			 * ($GLOBALS) or the ASSIGN_REF bind (global $$name) that follows would share/overwrite
+			 * it unchecked, bypassing its declared type. Promote it to a typed reference so that
+			 * write (or the reference shared by the bind) is type-checked, matching the static,
+			 * $$name and $GLOBALS paths. No-op for an untyped CV, a non-frame slot, or a slot
+			 * already a reference. The UNDEF case is handled by the branch above. */
+			zend_promote_defined_cv_to_typed_ref(execute_data, retval);
 		}
 	}
 
@@ -106633,18 +111017,56 @@ fetch_this:
 				goto fetch_this;
 			}
 			if (type == BP_VAR_W) {
-				ZVAL_NULL(retval);
+				/* A by-name write ($$name = ...) into a still-UNDEF slot. If the slot is a
+				 * typed CV, promote it to a typed reference so the ASSIGN that follows is
+				 * type-checked (closes the uninitialized-first-write hole); the slot is then
+				 * IS_REFERENCE and must not be reset to NULL. Otherwise initialise to NULL as
+				 * before. */
+				zend_promote_undef_cv_to_typed_ref(execute_data, retval);
+				if (Z_TYPE_P(retval) != IS_REFERENCE) {
+					ZVAL_NULL(retval);
+				}
 			} else if (type == BP_VAR_IS || type == BP_VAR_UNSET) {
 				retval = &EG(uninitialized_zval);
 			} else {
 				zend_error_unchecked(E_WARNING, "Undefined %svariable $%S",
 					(opline->extended_value & ZEND_FETCH_GLOBAL ? "global " : ""), name);
 				if (type == BP_VAR_RW && !EG(exception)) {
-					ZVAL_NULL(retval);
+					/* A by-name compound assign / inc-dec ($$name .= ..., $$name++)
+					 * into a still-UNDEF slot. Mirror the BP_VAR_W path, but use the
+					 * RW variant: the slot is first NULL-initialized (as the static
+					 * typed-CV RW path does after the undefined-variable warning) so
+					 * the binary op / increment runs on NULL, and if the slot is a
+					 * typed CV that NULL is wrapped in a typed reference so the
+					 * compound/inc-dec store that follows is type-checked (closes the
+					 * uninitialized-first-write hole on the RW fetch path); the slot
+					 * is then IS_REFERENCE and must not be reset. Untyped/non-frame
+					 * slots fall through to a bare NULL as before. */
+					zend_promote_undef_cv_to_typed_ref_rw(execute_data, retval);
+					if (Z_TYPE_P(retval) != IS_REFERENCE) {
+						ZVAL_NULL(retval);
+					}
 				} else {
 					retval = &EG(uninitialized_zval);
 				}
 			}
+		} else if ((type == BP_VAR_W || type == BP_VAR_RW)
+				&& (opline->extended_value & (ZEND_FETCH_GLOBAL | ZEND_FETCH_GLOBAL_LOCK))) {
+			/* A by-name WRITE through the GLOBAL symbol table resolved to a DEFINED CV slot.
+			 * Two callers reach here with a DEFINED slot:
+			 *   - $GLOBALS['name'] = ... / += ... / ++  (ZEND_FETCH_GLOBAL), and
+			 *   - the dynamic `global $$name` slow path: FETCH_W with ZEND_FETCH_GLOBAL_LOCK
+			 *     returns this INDIRECT, and the ASSIGN_REF that follows binds the global into
+			 *     the function-local CV by reference.
+			 * Either way the GLOBAL fetch returns &EG(symbol_table) without promoting typed CVs
+			 * (unlike the $$name/local path, which promotes via zend_get_target_symbol_table),
+			 * so a file-scope typed local is still a plain value here -- the ASSIGN/ASSIGN_OP/INC
+			 * ($GLOBALS) or the ASSIGN_REF bind (global $$name) that follows would share/overwrite
+			 * it unchecked, bypassing its declared type. Promote it to a typed reference so that
+			 * write (or the reference shared by the bind) is type-checked, matching the static,
+			 * $$name and $GLOBALS paths. No-op for an untyped CV, a non-frame slot, or a slot
+			 * already a reference. The UNDEF case is handled by the branch above. */
+			zend_promote_defined_cv_to_typed_ref(execute_data, retval);
 		}
 	}
 
@@ -109273,6 +113695,25 @@ ZEND_API void execute_ex(zend_execute_data *ex)
 			(void*)&&ZEND_INIT_PARENT_PROPERTY_HOOK_CALL_SPEC_CONST_UNUSED_LABEL,
 			(void*)&&ZEND_DECLARE_ATTRIBUTED_CONST_SPEC_CONST_CONST_LABEL,
 			(void*)&&ZEND_TYPE_ASSERT_SPEC_CONST_LABEL,
+			(void*)&&ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_UNUSED_LABEL,
+			(void*)&&ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_USED_LABEL,
+			(void*)&&ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_UNUSED_LABEL,
+			(void*)&&ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_USED_LABEL,
+			(void*)&&ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_UNUSED_LABEL,
+			(void*)&&ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_USED_LABEL,
+			(void*)&&ZEND_NULL_LABEL,
+			(void*)&&ZEND_NULL_LABEL,
+			(void*)&&ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_UNUSED_LABEL,
+			(void*)&&ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_USED_LABEL,
+			(void*)&&ZEND_ASSIGN_OP_TYPED_SPEC_CV_CONST_LABEL,
+			(void*)&&ZEND_ASSIGN_OP_TYPED_SPEC_CV_TMP_LABEL,
+			(void*)&&ZEND_NULL_LABEL,
+			(void*)&&ZEND_NULL_LABEL,
+			(void*)&&ZEND_ASSIGN_OP_TYPED_SPEC_CV_CV_LABEL,
+			(void*)&&ZEND_PRE_INC_TYPED_SPEC_CV_LABEL,
+			(void*)&&ZEND_PRE_DEC_TYPED_SPEC_CV_LABEL,
+			(void*)&&ZEND_POST_INC_TYPED_SPEC_CV_LABEL,
+			(void*)&&ZEND_POST_DEC_TYPED_SPEC_CV_LABEL,
 			(void*)&&ZEND_INIT_FCALL_OFFSET_SPEC_CONST_LABEL,
 			(void*)&&ZEND_RECV_NOTYPE_SPEC_LABEL,
 			(void*)&&ZEND_NULL_LABEL,
@@ -114310,6 +118751,26 @@ zend_leave_helper_SPEC_LABEL:
 				ZEND_ECHO_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
 				VM_TRACE_OP_END(ZEND_ECHO_SPEC_CV)
 				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_PRE_INC_TYPED_SPEC_CV):
+				VM_TRACE(ZEND_PRE_INC_TYPED_SPEC_CV)
+				ZEND_PRE_INC_TYPED_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_PRE_INC_TYPED_SPEC_CV)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_PRE_DEC_TYPED_SPEC_CV):
+				VM_TRACE(ZEND_PRE_DEC_TYPED_SPEC_CV)
+				ZEND_PRE_DEC_TYPED_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_PRE_DEC_TYPED_SPEC_CV)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_POST_INC_TYPED_SPEC_CV):
+				VM_TRACE(ZEND_POST_INC_TYPED_SPEC_CV)
+				ZEND_POST_INC_TYPED_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_POST_INC_TYPED_SPEC_CV)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_POST_DEC_TYPED_SPEC_CV):
+				VM_TRACE(ZEND_POST_DEC_TYPED_SPEC_CV)
+				ZEND_POST_DEC_TYPED_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_POST_DEC_TYPED_SPEC_CV)
+				HYBRID_BREAK();
 			HYBRID_CASE(ZEND_JMPZ_SPEC_CV):
 				VM_TRACE(ZEND_JMPZ_SPEC_CV)
 				ZEND_JMPZ_SPEC_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
@@ -114769,6 +119230,21 @@ zend_leave_helper_SPEC_LABEL:
 				ZEND_ASSIGN_SPEC_CV_CONST_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
 				VM_TRACE_OP_END(ZEND_ASSIGN_SPEC_CV_CONST_RETVAL_USED)
 				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_UNUSED):
+				VM_TRACE(ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_UNUSED)
+				ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_UNUSED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_UNUSED)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_USED):
+				VM_TRACE(ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_USED)
+				ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_USED)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_OP_TYPED_SPEC_CV_CONST):
+				VM_TRACE(ZEND_ASSIGN_OP_TYPED_SPEC_CV_CONST)
+				ZEND_ASSIGN_OP_TYPED_SPEC_CV_CONST_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_OP_TYPED_SPEC_CV_CONST)
+				HYBRID_BREAK();
 			HYBRID_CASE(ZEND_ASSIGN_OBJ_REF_SPEC_CV_CONST_OP_DATA_VAR):
 				VM_TRACE(ZEND_ASSIGN_OBJ_REF_SPEC_CV_CONST_OP_DATA_VAR)
 				ZEND_ASSIGN_OBJ_REF_SPEC_CV_CONST_OP_DATA_VAR_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
@@ -115069,6 +119545,21 @@ zend_leave_helper_SPEC_LABEL:
 				ZEND_ASSIGN_SPEC_CV_TMP_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
 				VM_TRACE_OP_END(ZEND_ASSIGN_SPEC_CV_TMP_RETVAL_USED)
 				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_UNUSED):
+				VM_TRACE(ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_UNUSED)
+				ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_UNUSED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_UNUSED)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_USED):
+				VM_TRACE(ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_USED)
+				ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_USED)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_OP_TYPED_SPEC_CV_TMP):
+				VM_TRACE(ZEND_ASSIGN_OP_TYPED_SPEC_CV_TMP)
+				ZEND_ASSIGN_OP_TYPED_SPEC_CV_TMP_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_OP_TYPED_SPEC_CV_TMP)
+				HYBRID_BREAK();
 			HYBRID_CASE(ZEND_ASSIGN_OBJ_REF_SPEC_CV_TMP_OP_DATA_VAR):
 				VM_TRACE(ZEND_ASSIGN_OBJ_REF_SPEC_CV_TMP_OP_DATA_VAR)
 				ZEND_ASSIGN_OBJ_REF_SPEC_CV_TMP_OP_DATA_VAR_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
@@ -115128,6 +119619,16 @@ zend_leave_helper_SPEC_LABEL:
 				VM_TRACE(ZEND_YIELD_SPEC_CV_TMP)
 				ZEND_YIELD_SPEC_CV_TMP_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
 				VM_TRACE_OP_END(ZEND_YIELD_SPEC_CV_TMP)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_UNUSED):
+				VM_TRACE(ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_UNUSED)
+				ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_UNUSED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_UNUSED)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_USED):
+				VM_TRACE(ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_USED)
+				ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_USED)
 				HYBRID_BREAK();
 			HYBRID_CASE(ZEND_ASSIGN_REF_SPEC_CV_VAR):
 				VM_TRACE(ZEND_ASSIGN_REF_SPEC_CV_VAR)
@@ -115498,6 +119999,21 @@ zend_leave_helper_SPEC_LABEL:
 				VM_TRACE(ZEND_ASSIGN_SPEC_CV_CV_RETVAL_USED)
 				ZEND_ASSIGN_SPEC_CV_CV_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
 				VM_TRACE_OP_END(ZEND_ASSIGN_SPEC_CV_CV_RETVAL_USED)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_UNUSED):
+				VM_TRACE(ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_UNUSED)
+				ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_UNUSED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_UNUSED)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_USED):
+				VM_TRACE(ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_USED)
+				ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_USED_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_USED)
+				HYBRID_BREAK();
+			HYBRID_CASE(ZEND_ASSIGN_OP_TYPED_SPEC_CV_CV):
+				VM_TRACE(ZEND_ASSIGN_OP_TYPED_SPEC_CV_CV)
+				ZEND_ASSIGN_OP_TYPED_SPEC_CV_CV_HANDLER(ZEND_OPCODE_HANDLER_ARGS_PASSTHRU);
+				VM_TRACE_OP_END(ZEND_ASSIGN_OP_TYPED_SPEC_CV_CV)
 				HYBRID_BREAK();
 			HYBRID_CASE(ZEND_ASSIGN_REF_SPEC_CV_CV):
 				VM_TRACE(ZEND_ASSIGN_REF_SPEC_CV_CV)
@@ -118211,6 +122727,25 @@ void zend_vm_init(void)
 		ZEND_INIT_PARENT_PROPERTY_HOOK_CALL_SPEC_CONST_UNUSED_HANDLER,
 		ZEND_DECLARE_ATTRIBUTED_CONST_SPEC_CONST_CONST_HANDLER,
 		ZEND_TYPE_ASSERT_SPEC_CONST_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_UNUSED_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_USED_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_UNUSED_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_USED_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_UNUSED_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_USED_HANDLER,
+		ZEND_NULL_HANDLER,
+		ZEND_NULL_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_UNUSED_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_USED_HANDLER,
+		ZEND_ASSIGN_OP_TYPED_SPEC_CV_CONST_HANDLER,
+		ZEND_ASSIGN_OP_TYPED_SPEC_CV_TMP_HANDLER,
+		ZEND_NULL_HANDLER,
+		ZEND_NULL_HANDLER,
+		ZEND_ASSIGN_OP_TYPED_SPEC_CV_CV_HANDLER,
+		ZEND_PRE_INC_TYPED_SPEC_CV_HANDLER,
+		ZEND_PRE_DEC_TYPED_SPEC_CV_HANDLER,
+		ZEND_POST_INC_TYPED_SPEC_CV_HANDLER,
+		ZEND_POST_DEC_TYPED_SPEC_CV_HANDLER,
 		ZEND_INIT_FCALL_OFFSET_SPEC_CONST_HANDLER,
 		ZEND_RECV_NOTYPE_SPEC_HANDLER,
 		ZEND_NULL_HANDLER,
@@ -121689,6 +126224,25 @@ void zend_vm_init(void)
 		ZEND_INIT_PARENT_PROPERTY_HOOK_CALL_SPEC_CONST_UNUSED_TAILCALL_HANDLER,
 		ZEND_DECLARE_ATTRIBUTED_CONST_SPEC_CONST_CONST_TAILCALL_HANDLER,
 		ZEND_TYPE_ASSERT_SPEC_CONST_TAILCALL_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_UNUSED_TAILCALL_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_CONST_RETVAL_USED_TAILCALL_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_UNUSED_TAILCALL_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_TMP_RETVAL_USED_TAILCALL_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_UNUSED_TAILCALL_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_VAR_RETVAL_USED_TAILCALL_HANDLER,
+		ZEND_NULL_TAILCALL_HANDLER,
+		ZEND_NULL_TAILCALL_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_UNUSED_TAILCALL_HANDLER,
+		ZEND_ASSIGN_TYPED_SPEC_CV_CV_RETVAL_USED_TAILCALL_HANDLER,
+		ZEND_ASSIGN_OP_TYPED_SPEC_CV_CONST_TAILCALL_HANDLER,
+		ZEND_ASSIGN_OP_TYPED_SPEC_CV_TMP_TAILCALL_HANDLER,
+		ZEND_NULL_TAILCALL_HANDLER,
+		ZEND_NULL_TAILCALL_HANDLER,
+		ZEND_ASSIGN_OP_TYPED_SPEC_CV_CV_TAILCALL_HANDLER,
+		ZEND_PRE_INC_TYPED_SPEC_CV_TAILCALL_HANDLER,
+		ZEND_PRE_DEC_TYPED_SPEC_CV_TAILCALL_HANDLER,
+		ZEND_POST_INC_TYPED_SPEC_CV_TAILCALL_HANDLER,
+		ZEND_POST_DEC_TYPED_SPEC_CV_TAILCALL_HANDLER,
 		ZEND_INIT_FCALL_OFFSET_SPEC_CONST_TAILCALL_HANDLER,
 		ZEND_RECV_NOTYPE_SPEC_TAILCALL_HANDLER,
 		ZEND_NULL_TAILCALL_HANDLER,
@@ -122657,7 +127211,7 @@ void zend_vm_init(void)
 		1255,
 		1256 | SPEC_RULE_OP1,
 		1261 | SPEC_RULE_OP1,
-		3474,
+		3493,
 		1266 | SPEC_RULE_OP1,
 		1271 | SPEC_RULE_OP1,
 		1276 | SPEC_RULE_OP2,
@@ -122691,7 +127245,7 @@ void zend_vm_init(void)
 		1559 | SPEC_RULE_OP1 | SPEC_RULE_OP2,
 		1584 | SPEC_RULE_OP1,
 		1589,
-		3474,
+		3493,
 		1590 | SPEC_RULE_OP1,
 		1595 | SPEC_RULE_OP1 | SPEC_RULE_OP2,
 		1620 | SPEC_RULE_OP1 | SPEC_RULE_OP2,
@@ -122824,50 +127378,50 @@ void zend_vm_init(void)
 		2556,
 		2557,
 		2558,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
-		3474,
+		2559 | SPEC_RULE_OP2 | SPEC_RULE_RETVAL,
+		2569 | SPEC_RULE_OP2,
+		2574,
+		2575,
+		2576,
+		2577,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
+		3493,
 	};
 #if 0
 #elif (ZEND_VM_KIND == ZEND_VM_KIND_HYBRID)
@@ -123060,7 +127614,7 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2567 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
+				spec = 2586 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
 				if (op->op1_type < op->op2_type) {
 					zend_swap_operands(op);
 				}
@@ -123068,7 +127622,7 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2592 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
+				spec = 2611 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
 				if (op->op1_type < op->op2_type) {
 					zend_swap_operands(op);
 				}
@@ -123076,7 +127630,7 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2617 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
+				spec = 2636 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
 				if (op->op1_type < op->op2_type) {
 					zend_swap_operands(op);
 				}
@@ -123087,17 +127641,17 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2642 | SPEC_RULE_OP1 | SPEC_RULE_OP2;
+				spec = 2661 | SPEC_RULE_OP1 | SPEC_RULE_OP2;
 			} else if (op1_info == MAY_BE_LONG && op2_info == MAY_BE_LONG) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2667 | SPEC_RULE_OP1 | SPEC_RULE_OP2;
+				spec = 2686 | SPEC_RULE_OP1 | SPEC_RULE_OP2;
 			} else if (op1_info == MAY_BE_DOUBLE && op2_info == MAY_BE_DOUBLE) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2692 | SPEC_RULE_OP1 | SPEC_RULE_OP2;
+				spec = 2711 | SPEC_RULE_OP1 | SPEC_RULE_OP2;
 			}
 			break;
 		case ZEND_MUL:
@@ -123108,17 +127662,17 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2717 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
+				spec = 2736 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
 			} else if (op1_info == MAY_BE_LONG && op2_info == MAY_BE_LONG) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2742 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
+				spec = 2761 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
 			} else if (op1_info == MAY_BE_DOUBLE && op2_info == MAY_BE_DOUBLE) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2767 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
+				spec = 2786 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
 			}
 			break;
 		case ZEND_IS_IDENTICAL:
@@ -123129,16 +127683,16 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2792 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 2811 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			} else if (op1_info == MAY_BE_DOUBLE && op2_info == MAY_BE_DOUBLE) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2867 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 2886 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			} else if (op->op2_type == IS_CONST && (Z_TYPE_P(RT_CONSTANT(op, op->op2)) == IS_ARRAY && zend_hash_num_elements(Z_ARR_P(RT_CONSTANT(op, op->op2))) == 0)) {
-				spec = 3092 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 3111 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			} else if (op->op1_type == IS_CV && (op->op2_type & (IS_CONST|IS_CV)) && !(op1_info & (MAY_BE_UNDEF|MAY_BE_REF)) && !(op2_info & (MAY_BE_UNDEF|MAY_BE_REF))) {
-				spec = 3098 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
+				spec = 3117 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
 			}
 			break;
 		case ZEND_IS_NOT_IDENTICAL:
@@ -123149,16 +127703,16 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2942 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 2961 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			} else if (op1_info == MAY_BE_DOUBLE && op2_info == MAY_BE_DOUBLE) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 3017 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 3036 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			} else if (op->op2_type == IS_CONST && (Z_TYPE_P(RT_CONSTANT(op, op->op2)) == IS_ARRAY && zend_hash_num_elements(Z_ARR_P(RT_CONSTANT(op, op->op2))) == 0)) {
-				spec = 3095 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 3114 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			} else if (op->op1_type == IS_CV && (op->op2_type & (IS_CONST|IS_CV)) && !(op1_info & (MAY_BE_UNDEF|MAY_BE_REF)) && !(op2_info & (MAY_BE_UNDEF|MAY_BE_REF))) {
-				spec = 3103 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
+				spec = 3122 | SPEC_RULE_OP2 | SPEC_RULE_COMMUTATIVE;
 			}
 			break;
 		case ZEND_IS_EQUAL:
@@ -123169,12 +127723,12 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2792 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 2811 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			} else if (op1_info == MAY_BE_DOUBLE && op2_info == MAY_BE_DOUBLE) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2867 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 2886 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			}
 			break;
 		case ZEND_IS_NOT_EQUAL:
@@ -123185,12 +127739,12 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 2942 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 2961 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			} else if (op1_info == MAY_BE_DOUBLE && op2_info == MAY_BE_DOUBLE) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 3017 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
+				spec = 3036 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH | SPEC_RULE_COMMUTATIVE;
 			}
 			break;
 		case ZEND_IS_SMALLER:
@@ -123198,12 +127752,12 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 3108 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH;
+				spec = 3127 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH;
 			} else if (op1_info == MAY_BE_DOUBLE && op2_info == MAY_BE_DOUBLE) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 3183 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH;
+				spec = 3202 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH;
 			}
 			break;
 		case ZEND_IS_SMALLER_OR_EQUAL:
@@ -123211,79 +127765,79 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 3258 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH;
+				spec = 3277 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH;
 			} else if (op1_info == MAY_BE_DOUBLE && op2_info == MAY_BE_DOUBLE) {
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 3333 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH;
+				spec = 3352 | SPEC_RULE_OP1 | SPEC_RULE_OP2 | SPEC_RULE_SMART_BRANCH;
 			}
 			break;
 		case ZEND_QM_ASSIGN:
 			if (op1_info == MAY_BE_LONG) {
-				spec = 3420 | SPEC_RULE_OP1;
+				spec = 3439 | SPEC_RULE_OP1;
 			} else if (op1_info == MAY_BE_DOUBLE) {
-				spec = 3425 | SPEC_RULE_OP1;
+				spec = 3444 | SPEC_RULE_OP1;
 			} else if ((op->op1_type == IS_CONST) ? !Z_REFCOUNTED_P(RT_CONSTANT(op, op->op1)) : (!(op1_info & ((MAY_BE_ANY|MAY_BE_UNDEF)-(MAY_BE_NULL|MAY_BE_FALSE|MAY_BE_TRUE|MAY_BE_LONG|MAY_BE_DOUBLE))))) {
-				spec = 3430 | SPEC_RULE_OP1;
+				spec = 3449 | SPEC_RULE_OP1;
 			}
 			break;
 		case ZEND_PRE_INC:
 			if (res_info == MAY_BE_LONG && op1_info == MAY_BE_LONG) {
-				spec = 3408 | SPEC_RULE_RETVAL;
+				spec = 3427 | SPEC_RULE_RETVAL;
 			} else if (op1_info == MAY_BE_LONG) {
-				spec = 3410 | SPEC_RULE_RETVAL;
+				spec = 3429 | SPEC_RULE_RETVAL;
 			}
 			break;
 		case ZEND_PRE_DEC:
 			if (res_info == MAY_BE_LONG && op1_info == MAY_BE_LONG) {
-				spec = 3412 | SPEC_RULE_RETVAL;
+				spec = 3431 | SPEC_RULE_RETVAL;
 			} else if (op1_info == MAY_BE_LONG) {
-				spec = 3414 | SPEC_RULE_RETVAL;
+				spec = 3433 | SPEC_RULE_RETVAL;
 			}
 			break;
 		case ZEND_POST_INC:
 			if (res_info == MAY_BE_LONG && op1_info == MAY_BE_LONG) {
-				spec = 3416;
+				spec = 3435;
 			} else if (op1_info == MAY_BE_LONG) {
-				spec = 3417;
+				spec = 3436;
 			}
 			break;
 		case ZEND_POST_DEC:
 			if (res_info == MAY_BE_LONG && op1_info == MAY_BE_LONG) {
-				spec = 3418;
+				spec = 3437;
 			} else if (op1_info == MAY_BE_LONG) {
-				spec = 3419;
+				spec = 3438;
 			}
 			break;
 		case ZEND_JMP:
 			if (OP_JMP_ADDR(op, op->op1) > op) {
-				spec = 2566;
+				spec = 2585;
 			}
 			break;
 		case ZEND_INIT_FCALL:
 			if (Z_EXTRA_P(RT_CONSTANT(op, op->op2)) != 0) {
-				spec = 2559;
+				spec = 2578;
 			}
 			break;
 		case ZEND_RECV:
 			if (op->op2.num == MAY_BE_ANY) {
-				spec = 2560;
+				spec = 2579;
 			}
 			break;
 		case ZEND_SEND_VAL:
 			if (op->op1_type == IS_CONST && op->op2_type == IS_UNUSED && !Z_REFCOUNTED_P(RT_CONSTANT(op, op->op1))) {
-				spec = 3470;
+				spec = 3489;
 			}
 			break;
 		case ZEND_SEND_VAR_EX:
 			if (op->op2_type == IS_UNUSED && op->op2.num <= MAX_ARG_FLAG_NUM && (op1_info & (MAY_BE_UNDEF|MAY_BE_REF)) == 0) {
-				spec = 3465 | SPEC_RULE_OP1;
+				spec = 3484 | SPEC_RULE_OP1;
 			}
 			break;
 		case ZEND_FE_FETCH_R:
 			if (op->op2_type == IS_CV && (op1_info & (MAY_BE_ANY|MAY_BE_REF)) == MAY_BE_ARRAY) {
-				spec = 3472 | SPEC_RULE_RETVAL;
+				spec = 3491 | SPEC_RULE_RETVAL;
 			}
 			break;
 		case ZEND_FETCH_DIM_R:
@@ -123291,22 +127845,22 @@ ZEND_API void ZEND_FASTCALL zend_vm_set_opcode_handler_ex(zend_op* op, uint32_t 
 				if (op->op1_type == IS_CONST && op->op2_type == IS_CONST) {
 					break;
 				}
-				spec = 3435 | SPEC_RULE_OP1 | SPEC_RULE_OP2;
+				spec = 3454 | SPEC_RULE_OP1 | SPEC_RULE_OP2;
 			}
 			break;
 		case ZEND_SEND_VAL_EX:
 			if (op->op2_type == IS_UNUSED && op->op2.num <= MAX_ARG_FLAG_NUM && op->op1_type == IS_CONST && !Z_REFCOUNTED_P(RT_CONSTANT(op, op->op1))) {
-				spec = 3471;
+				spec = 3490;
 			}
 			break;
 		case ZEND_SEND_VAR:
 			if (op->op2_type == IS_UNUSED && (op1_info & (MAY_BE_UNDEF|MAY_BE_REF)) == 0) {
-				spec = 3460 | SPEC_RULE_OP1;
+				spec = 3479 | SPEC_RULE_OP1;
 			}
 			break;
 		case ZEND_COUNT:
 			if ((op1_info & (MAY_BE_ANY|MAY_BE_UNDEF|MAY_BE_REF)) == MAY_BE_ARRAY) {
-				spec = 2561 | SPEC_RULE_OP1;
+				spec = 2580 | SPEC_RULE_OP1;
 			}
 			break;
 		case ZEND_BW_OR:

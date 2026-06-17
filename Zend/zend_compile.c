@@ -557,7 +557,37 @@ static uint32_t lookup_cv(zend_string *name) /* {{{ */{
 	}
 
 	op_array->vars[i] = zend_string_copy(name);
+
+	/* Keep cv_types[] parallel to vars[] when typed locals are in use. vars[] is
+	 * grown in chunks (vars_size), but cv_types[] is sized to exactly last_var, so
+	 * grow it by one for the CV just appended. Guarded so untyped functions, which
+	 * never allocate cv_types, pay nothing. */
+	if (op_array->cv_types) {
+		op_array->cv_types = erealloc(op_array->cv_types, sizeof(zend_property_info*) * op_array->last_var);
+		op_array->cv_types[op_array->last_var - 1] = NULL;
+	}
+
 	return EX_NUM_TO_VAR(i);
+}
+/* }}} */
+
+/* Returns the synthesized type info of an already-declared typed local with this name,
+ * or NULL if no such CV exists or it is untyped. Does NOT create a CV (unlike lookup_cv),
+ * so it is safe to probe from compile paths that must reject typed locals. */
+static zend_property_info *zend_find_typed_local(zend_string *name) /* {{{ */
+{
+	zend_op_array *op_array = CG(active_op_array);
+	if (!op_array->cv_types) {
+		return NULL;
+	}
+	zend_ulong hash_value = zend_string_hash_val(name);
+	for (int i = 0; i < op_array->last_var; i++) {
+		if (ZSTR_H(op_array->vars[i]) == hash_value
+		 && zend_string_equals(op_array->vars[i], name)) {
+			return op_array->cv_types[i];
+		}
+	}
+	return NULL;
 }
 /* }}} */
 
@@ -761,6 +791,7 @@ bool zend_op_may_elide_result(uint8_t opcode)
 		case ZEND_ASSIGN_OBJ:
 		case ZEND_ASSIGN_STATIC_PROP:
 		case ZEND_ASSIGN_OP:
+		case ZEND_ASSIGN_OP_TYPED:
 		case ZEND_ASSIGN_DIM_OP:
 		case ZEND_ASSIGN_OBJ_OP:
 		case ZEND_ASSIGN_STATIC_PROP_OP:
@@ -770,6 +801,8 @@ bool zend_op_may_elide_result(uint8_t opcode)
 		case ZEND_PRE_DEC_OBJ:
 		case ZEND_PRE_INC:
 		case ZEND_PRE_DEC:
+		case ZEND_PRE_INC_TYPED:
+		case ZEND_PRE_DEC_TYPED:
 		case ZEND_DO_FCALL:
 		case ZEND_DO_ICALL:
 		case ZEND_DO_UCALL:
@@ -805,7 +838,9 @@ static void zend_do_free(znode *op1) /* {{{ */
 				case ZEND_POST_DEC_OBJ:
 				case ZEND_POST_INC:
 				case ZEND_POST_DEC:
-					/* convert $i++ to ++$i */
+				case ZEND_POST_INC_TYPED:
+				case ZEND_POST_DEC_TYPED:
+					/* convert $i++ to ++$i (POST_*_TYPED = PRE_*_TYPED + 2) */
 					opline->opcode -= 2;
 					SET_UNUSED(opline->result);
 					return;
@@ -3521,6 +3556,20 @@ static void zend_compile_assign(znode *result, zend_ast *ast, bool stmt, uint32_
 			zend_compile_expr(&expr_node, expr_ast);
 			zend_delayed_compile_end(offset);
 			CG(zend_lineno) = zend_ast_get_lineno(var_ast);
+			/* If the target is a typed local CV, enforce the declared type on every
+			 * (re)assignment by emitting ZEND_ASSIGN_TYPED instead of plain ZEND_ASSIGN.
+			 * The operand setup mirrors the initializer path in
+			 * zend_compile_typed_var_decl(); cv_types[] persists across unset()/reuse,
+			 * so this also covers `int $x; $x = ...;` and post-unset reassignment.
+			 * Only simple CV targets are affected; dynamic/auto-global $$vars compile to
+			 * a non-CV var_node and fall through to plain ZEND_ASSIGN unchanged. */
+			if (var_node.op_type == IS_CV && CG(active_op_array)->cv_types) {
+				uint32_t cv_index = EX_VAR_TO_NUM(var_node.u.op.var);
+				if (CG(active_op_array)->cv_types[cv_index]) {
+					zend_emit_op_tmp(result, ZEND_ASSIGN_TYPED, &var_node, &expr_node);
+					return;
+				}
+			}
 			zend_emit_op_tmp(result, ZEND_ASSIGN, &var_node, &expr_node);
 			return;
 		case ZEND_AST_STATIC_PROP:
@@ -3702,7 +3751,18 @@ static void zend_compile_compound_assign(znode *result, zend_ast *ast) /* {{{ */
 			zend_delayed_compile_var(&var_node, var_ast, BP_VAR_RW, false);
 			zend_compile_expr(&expr_node, expr_ast);
 			zend_delayed_compile_end(offset);
-			opline = zend_emit_op_tmp(result, ZEND_ASSIGN_OP, &var_node, &expr_node);
+			/* If the target is a typed local CV, enforce the declared type on the
+			 * result of the compound operation by emitting ZEND_ASSIGN_OP_TYPED
+			 * instead of plain ZEND_ASSIGN_OP, mirroring the ZEND_ASSIGN_TYPED
+			 * choice in zend_compile_assign(). Only simple CV targets are typed;
+			 * dynamic/auto-global $$vars compile to a non-CV var_node and fall
+			 * through to plain ZEND_ASSIGN_OP unchanged. */
+			if (var_node.op_type == IS_CV && CG(active_op_array)->cv_types
+			 && CG(active_op_array)->cv_types[EX_VAR_TO_NUM(var_node.u.op.var)]) {
+				opline = zend_emit_op_tmp(result, ZEND_ASSIGN_OP_TYPED, &var_node, &expr_node);
+			} else {
+				opline = zend_emit_op_tmp(result, ZEND_ASSIGN_OP, &var_node, &expr_node);
+			}
 			opline->extended_value = opcode;
 			return;
 		case ZEND_AST_STATIC_PROP:
@@ -5747,7 +5807,13 @@ static bool zend_call_ast_returns_nonnullable_scalar(zend_ast *ast, uint8_t scal
  *   - `$this->prop` typed exactly non-nullable `string`/`int` (Tier 2);
  *   - a call provably returning a non-nullable `string`/`int`: `$this->m()`, `self::m()`,
  *     `static::m()`, `parent::m()`, or a plain `f()` to an internal/finalized user
- *     function with that declared return type (Tier 2).
+ *     function with that declared return type (Tier 2);
+ *   - a local variable declared as a non-nullable `string`/`int` typed local (Tier 3):
+ *     the type is enforced on every write, so the value is guaranteed at any read.
+ *     `?string`/`?int` is excluded (nullable); `$$name` is excluded (name child not a
+ *     literal ZVAL); untyped CVs return NULL from zend_find_typed_local. Declaration-order
+ *     dependent: the local must be declared textually above the call, because cv_types[]
+ *     is built top-down (a documented, conservative limitation).
  *
  * The governing rule throughout: desugar ONLY when the receiver is GUARANTEED a single
  * non-nullable scalar provable at compile time from known/declared context; otherwise
@@ -5861,6 +5927,23 @@ static uint8_t zend_get_static_scalar_ast_type(zend_ast *ast) /* {{{ */
 		}
 		return 0;
 	}
+	/* Tier 3: a local variable `$x` declared as a non-nullable `string`/`int` typed local. */
+	if (ast->kind == ZEND_AST_VAR) {
+		zend_ast *name_ast = ast->child[0];
+		if (name_ast->kind == ZEND_AST_ZVAL
+		 && Z_TYPE_P(zend_ast_get_zval(name_ast)) == IS_STRING) {
+			zend_property_info *info = zend_find_typed_local(Z_STR_P(zend_ast_get_zval(name_ast)));
+			if (info) {
+				if (zend_type_is_nonnullable_scalar(info->type, IS_STRING)) {
+					return IS_STRING;
+				}
+				if (zend_type_is_nonnullable_scalar(info->type, IS_LONG)) {
+					return IS_LONG;
+				}
+			}
+		}
+		return 0;
+	}
 	return 0;
 }
 /* }}} */
@@ -5940,11 +6023,6 @@ static void zend_compile_method_call(znode *result, zend_ast *ast, uint32_t type
 	zend_ast *method_ast = ast->child[1];
 	zend_ast *args_ast = ast->child[2];
 
-	/* Scalar object methods: if the receiver is a compile-time-guaranteed scalar
-	 * (string/int literal, cast, concat, interpolation, $this typed prop, or a call
-	 * with a non-nullable scalar return type), rewrite `<recv>->m(args)` into a static
-	 * call on the internal Str/Int backing class. Object/null/unknown receivers fall
-	 * through to the normal method-call path below, byte-for-byte unchanged. */
 	if (zend_try_compile_scalar_method_call(result, ast, type)) {
 		return;
 	}
@@ -6193,7 +6271,18 @@ static void zend_compile_global_var(zend_ast *ast) /* {{{ */
 	// TODO(GLOBALS) Forbid "global $GLOBALS"?
 	if (is_this_fetch(var_ast)) {
 		zend_error_noreturn(E_COMPILE_ERROR, "Cannot use $this as global variable");
-	} else if (zend_try_compile_cv(&result, var_ast, BP_VAR_R) == SUCCESS) {
+	}
+	/* A `global $x` binding turns $x into a reference to the global, bypassing the
+	 * declared scalar type. This reference path is not enforced, so forbid it. */
+	if (name_ast->kind == ZEND_AST_ZVAL && Z_TYPE_P(zend_ast_get_zval(name_ast)) == IS_STRING) {
+		zend_property_info *info = zend_find_typed_local(Z_STR_P(zend_ast_get_zval(name_ast)));
+		if (info) {
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Cannot use typed local variable $%s as global variable",
+				ZSTR_VAL(info->name));
+		}
+	}
+	if (zend_try_compile_cv(&result, var_ast, BP_VAR_R) == SUCCESS) {
 		zend_op *opline = zend_emit_op(NULL, ZEND_BIND_GLOBAL, &result, &name_node);
 		opline->extended_value = zend_alloc_cache_slot();
 	} else {
@@ -6245,6 +6334,13 @@ static void zend_compile_static_var(zend_ast *ast) /* {{{ */
 
 	if (zend_string_equals(var_name, ZSTR_KNOWN(ZEND_STR_THIS))) {
 		zend_error_noreturn(E_COMPILE_ERROR, "Cannot use $this as static variable");
+	}
+
+	/* A `static $x` binding turns $x into a reference to the static slot, bypassing the
+	 * declared scalar type. This reference path is not enforced, so forbid it. */
+	if (zend_find_typed_local(var_name)) {
+		zend_error_noreturn(E_COMPILE_ERROR,
+			"Cannot use typed local variable $%s as static variable", ZSTR_VAL(var_name));
 	}
 
 	if (!CG(active_op_array)->static_variables) {
@@ -6860,6 +6956,20 @@ static void zend_compile_foreach(zend_ast *ast) /* {{{ */
 
 	if (value_ast->kind == ZEND_AST_ARRAY && zend_propagate_list_refs(value_ast)) {
 		by_ref = true;
+	}
+
+	/* `foreach ($arr as &$x)` makes the typed local $x a reference into the array
+	 * element, bypassing its declared scalar type. This reference path is not
+	 * enforced, so forbid it. */
+	if (by_ref && value_ast->kind == ZEND_AST_VAR
+	 && value_ast->child[0]->kind == ZEND_AST_ZVAL
+	 && Z_TYPE_P(zend_ast_get_zval(value_ast->child[0])) == IS_STRING) {
+		zend_property_info *info = zend_find_typed_local(Z_STR_P(zend_ast_get_zval(value_ast->child[0])));
+		if (info) {
+			zend_error_noreturn(E_COMPILE_ERROR,
+				"Cannot use typed local variable $%s as foreach by-reference value",
+				ZSTR_VAL(info->name));
+		}
 	}
 
 	if (by_ref && is_variable) {
@@ -11181,8 +11291,15 @@ static void zend_compile_post_incdec(znode *result, const zend_ast *ast) /* {{{ 
 		if (opline && opline->opcode == ZEND_FETCH_DIM_RW) {
 			opline->extended_value = ZEND_FETCH_DIM_INCDEC;
 		}
-		zend_emit_op_tmp(result, ast->kind == ZEND_AST_POST_INC ? ZEND_POST_INC : ZEND_POST_DEC,
-			&var_node, NULL);
+		/* Typed local CV: emit the type-enforcing variant (see ZEND_PRE_INC_TYPED). */
+		uint8_t opcode;
+		if (var_node.op_type == IS_CV && CG(active_op_array)->cv_types
+		 && CG(active_op_array)->cv_types[EX_VAR_TO_NUM(var_node.u.op.var)]) {
+			opcode = ast->kind == ZEND_AST_POST_INC ? ZEND_POST_INC_TYPED : ZEND_POST_DEC_TYPED;
+		} else {
+			opcode = ast->kind == ZEND_AST_POST_INC ? ZEND_POST_INC : ZEND_POST_DEC;
+		}
+		zend_emit_op_tmp(result, opcode, &var_node, NULL);
 	}
 }
 /* }}} */
@@ -11210,8 +11327,15 @@ static void zend_compile_pre_incdec(znode *result, const zend_ast *ast) /* {{{ *
 		if (opline && opline->opcode == ZEND_FETCH_DIM_RW) {
 			opline->extended_value = ZEND_FETCH_DIM_INCDEC;
 		}
-		zend_emit_op_tmp(result, ast->kind == ZEND_AST_PRE_INC ? ZEND_PRE_INC : ZEND_PRE_DEC,
-			&var_node, NULL);
+		/* Typed local CV: emit the type-enforcing variant (see ZEND_PRE_INC_TYPED). */
+		uint8_t opcode;
+		if (var_node.op_type == IS_CV && CG(active_op_array)->cv_types
+		 && CG(active_op_array)->cv_types[EX_VAR_TO_NUM(var_node.u.op.var)]) {
+			opcode = ast->kind == ZEND_AST_PRE_INC ? ZEND_PRE_INC_TYPED : ZEND_PRE_DEC_TYPED;
+		} else {
+			opcode = ast->kind == ZEND_AST_PRE_INC ? ZEND_PRE_INC : ZEND_PRE_DEC;
+		}
+		zend_emit_op_tmp(result, opcode, &var_node, NULL);
 	}
 }
 /* }}} */
@@ -12440,6 +12564,90 @@ void zend_compile_top_stmt(zend_ast *ast) /* {{{ */
 }
 /* }}} */
 
+static void zend_compile_typed_var_decl(zend_ast *ast) /* {{{ */
+{
+	zend_ast *type_ast = ast->child[0];
+	zend_ast *var_ast  = ast->child[1];
+	zend_ast *init_ast = ast->child[2];   /* may be NULL */
+	zend_op_array *op_array = CG(active_op_array);
+
+	/* child[1] is the raw T_VARIABLE semantic value: a ZEND_AST_ZVAL node whose
+	 * zval is the variable name (the leading '$' was stripped by the scanner). The
+	 * grammar (typed_local_decl) always produces an IS_STRING zval here. Intern it the
+	 * same way zend_try_compile_cv() does so the string stored in vars[] matches the
+	 * canonical CV path (and opcache's interned-string accounting). zval_make_interned_string()
+	 * replaces the zval in place; the AST keeps ownership, so we hold only a borrowed ref. */
+	zval *name_zv = zend_ast_get_zval(var_ast);
+	ZEND_ASSERT(Z_TYPE_P(name_zv) == IS_STRING);
+	zend_string *name = zval_make_interned_string(name_zv);
+
+	/* Special variables cannot be given a type. The canonical CV path
+	 * (zend_try_compile_cv) silently routes auto-globals / $this / $GLOBALS away from
+	 * the CV slot; for a typed declaration that would mean the type is silently
+	 * dropped (or, worse, a superglobal gets shadowed), so reject them outright
+	 * (finding I1). Mirrors is_this_fetch()/is_globals_fetch() name handling. */
+	if (zend_is_auto_global(name)
+	 || zend_string_equals(name, ZSTR_KNOWN(ZEND_STR_THIS))
+	 || zend_string_equals_literal(name, "GLOBALS")) {
+		zend_error_noreturn(E_COMPILE_ERROR,
+			"Cannot declare a type for the special variable $%s", ZSTR_VAL(name));
+	}
+
+	/* lookup_cv() returns an EX_NUM_TO_VAR()-encoded operand, not a raw index, and
+	 * it appends a new CV (growing last_var) only when the name is not yet interned.
+	 * Capture last_var beforehand so we can tell whether this decl is the variable's
+	 * first appearance. */
+	uint32_t prev_last_var = op_array->last_var;
+	uint32_t var = lookup_cv(name);
+	uint32_t var_num = EX_VAR_TO_NUM(var);
+
+	/* First-appearance rule: a typed decl must be the variable's first use, and it
+	 * must not re-type an already-typed local (spec §6.3). */
+	if (var_num < prev_last_var) {
+		if (op_array->cv_types && op_array->cv_types[var_num]) {
+			zend_error_noreturn(E_COMPILE_ERROR, "Cannot redeclare typed local variable $%s", ZSTR_VAL(name));
+		}
+		zend_error_noreturn(E_COMPILE_ERROR,
+			"Cannot declare a type for $%s after it has already been used", ZSTR_VAL(name));
+	}
+
+	/* Resolve + restrict to scalars only (spec §6.4). */
+	zend_type type = zend_compile_typename(type_ast);
+	uint32_t mask = ZEND_TYPE_PURE_MASK(type);
+	uint32_t base = mask & ~MAY_BE_NULL;
+	if (!(base == MAY_BE_STRING || base == MAY_BE_LONG || base == MAY_BE_DOUBLE || base == MAY_BE_BOOL)) {
+		zend_type_release(type, 0);
+		zend_error_noreturn(E_COMPILE_ERROR,
+			"Typed local variables support only scalar types (int, float, string, bool) in this version");
+	}
+
+	zend_property_info *info = emalloc(sizeof(zend_property_info));
+	memset(info, 0, sizeof(*info));
+	info->type  = type;
+	info->name  = zend_string_copy(name);   /* owned; released in destroy_op_array */
+	info->flags = ZEND_ACC_PUBLIC;
+
+	if (!op_array->cv_types) {
+		op_array->cv_types = ecalloc(op_array->last_var, sizeof(zend_property_info*));
+	}
+	op_array->cv_types[var_num] = info;
+
+	if (init_ast) {
+		/* Emit ZEND_ASSIGN_TYPED with op1 = the CV target, op2 = the value. The CV
+		 * operand is built exactly as zend_try_compile_cv() builds it for `$cv = expr`. */
+		znode var_node, value_node;
+
+		zend_compile_expr(&value_node, init_ast);
+
+		var_node.op_type = IS_CV;
+		var_node.u.op.var = var;
+
+		CG(zend_lineno) = zend_ast_get_lineno(var_ast);
+		zend_emit_op(NULL, ZEND_ASSIGN_TYPED, &var_node, &value_node);
+	}
+}
+/* }}} */
+
 static void zend_compile_stmt(zend_ast *ast) /* {{{ */
 {
 	if (!ast) {
@@ -12554,6 +12762,9 @@ static void zend_compile_stmt(zend_ast *ast) /* {{{ */
 		case ZEND_AST_ASSIGN_REF:
 			zend_compile_assign_ref(NULL, ast, BP_VAR_R);
 			return;
+		case ZEND_AST_TYPED_VAR_DECL:
+			zend_compile_typed_var_decl(ast);
+			break;
 		default:
 		{
 			znode result;
