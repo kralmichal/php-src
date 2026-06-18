@@ -5323,6 +5323,11 @@ static zend_vm_opcode_handler_t zend_jit_trace(zend_jit_trace_rec *trace_buffer,
 							/* Named parameters not supported in JIT */
 							break;
 						}
+						if (zend_jit_op1_is_typed_cv(opline, op_array)) {
+							/* Typed local: let the VM handler create the reference so the
+							 * local's type source is attached (inline codegen would not). */
+							break;
+						}
 						op1_info = OP1_INFO();
 						if (!zend_jit_send_ref(&ctx, opline, op_array,
 								op1_info, 0)) {
@@ -5345,6 +5350,14 @@ static zend_vm_opcode_handler_t zend_jit_trace(zend_jit_trace_rec *trace_buffer,
 						if ((opline->opcode == ZEND_SEND_VAR_EX
 						  || opline->opcode == ZEND_SEND_VAR_NO_REF_EX)
 						 && opline->op2.num > MAX_ARG_FLAG_NUM) {
+							break;
+						}
+						if ((opline->opcode == ZEND_SEND_VAR_EX
+						  || opline->opcode == ZEND_SEND_VAR_NO_REF_EX
+						  || opline->opcode == ZEND_SEND_FUNC_ARG)
+						 && zend_jit_op1_is_typed_cv(opline, op_array)) {
+							/* Typed local possibly sent by reference: let the VM handler
+							 * create the reference so the local's type source is attached. */
 							break;
 						}
 						op1_addr = OP1_REG_ADDR();
@@ -5629,6 +5642,17 @@ static zend_vm_opcode_handler_t zend_jit_trace(zend_jit_trace_rec *trace_buffer,
 										}
 									}
 									if (info & (MAY_BE_STRING|MAY_BE_ARRAY|MAY_BE_OBJECT|MAY_BE_RESOURCE|MAY_BE_REF)) {
+										/* A typed local that was aliased into a reference attached its
+										 * synthesized type as a source on that reference; remove it here
+										 * (balanced with the add at ref-creation time) before the CV slot
+										 * drops its refcount, mirroring i_free_compiled_variables(). */
+										if (op_array->cv_types != NULL
+										 && op_array->cv_types[j] != NULL
+										 && (info & MAY_BE_REF)) {
+											if (!zend_jit_del_typed_cv_ref_source(&ctx, op_array->cv_types[j], j)) {
+												goto jit_failure;
+											}
+										}
 										if (!left_frame) {
 											left_frame = 1;
 										    if (!zend_jit_leave_frame(&ctx)) {
@@ -6501,7 +6525,8 @@ static zend_vm_opcode_handler_t zend_jit_trace(zend_jit_trace_rec *trace_buffer,
 					op2_info = MAY_BE_RC1 | MAY_BE_RCN | MAY_BE_REF | MAY_BE_ANY  | MAY_BE_ARRAY_KEY_ANY | MAY_BE_ARRAY_OF_ANY | MAY_BE_ARRAY_OF_REF;
 				}
 				if (!zend_jit_trace_handler(&ctx, op_array, opline,
-						zend_may_throw_ex(opline, ssa_op, op_array, ssa, op1_info, op2_info), p + 1)) {
+						zend_may_throw_ex(opline, ssa_op, op_array, ssa, op1_info, op2_info)
+						|| zend_jit_ref_op_may_throw_uninit_typed_cv(opline, op_array), p + 1)) {
 					goto jit_failure;
 				}
 				if ((p+1)->op == ZEND_JIT_TRACE_INIT_CALL && (p+1)->func) {
