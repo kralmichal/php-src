@@ -1714,6 +1714,36 @@ static zend_string* php_prefix_varname(const zend_string *prefix, const zend_str
 	return zend_string_concat3(ZSTR_VAL(prefix), ZSTR_LEN(prefix), ZEND_STRL("_"), ZSTR_VAL(var_name), ZSTR_LEN(var_name));
 }
 
+/* extract() resolved a symbol-table IS_INDIRECT entry into a CV slot (`orig_var`) it is about
+ * to overwrite/initialize. If that slot is a still-UNDEF typed local of the caller frame,
+ * promote it to a typed reference here so the assignment that follows (ZEND_TRY_ASSIGN_COPY_EX,
+ * which routes a typed reference through zend_try_assign_typed_ref_zval_ex) enforces the local's
+ * declared type instead of storing the value unchecked. extract() is an internal function, so
+ * the typed local's owning frame is the calling user frame; the engine helper walks from the
+ * current execute_data past extract()'s own (internal) frame to find it. No-op for an untyped
+ * slot or any non-UNDEF slot (the latter is already enforced by the assign itself). */
+static zend_always_inline void php_extract_promote_undef_typed_local(zval *orig_var)
+{
+	if (Z_TYPE_P(orig_var) == IS_UNDEF) {
+		zend_promote_undef_cv_to_typed_ref(EG(current_execute_data), orig_var);
+	}
+}
+
+/* Overwrite/initialize the resolved CV slot `orig_var` with `entry`, enforcing the declared type
+ * if `orig_var` is a typed local: promote a still-UNDEF typed slot to a typed reference, do the
+ * type-checked copy, and if that throws (non-coercible value), collapse the freshly-promoted
+ * reference so the local is left undefined -- mirroring a failed static assignment. `entry` must
+ * already be dereferenced (ZVAL_DEREF) by the caller. The caller checks EG(exception) afterwards
+ * for its own cleanup. */
+static zend_always_inline void php_extract_assign_typed(zval *orig_var, zval *entry, bool strict)
+{
+	php_extract_promote_undef_typed_local(orig_var);
+	ZEND_TRY_ASSIGN_COPY_EX(orig_var, entry, strict);
+	if (UNEXPECTED(EG(exception))) {
+		zend_collapse_promoted_undef_ref(orig_var);
+	}
+}
+
 static zend_long php_extract_ref_if_exists(const zend_array *arr, const zend_array *symbol_table) /* {{{ */
 {
 	zend_long count = 0;
@@ -1760,7 +1790,7 @@ static zend_long php_extract_ref_if_exists(const zend_array *arr, const zend_arr
 }
 /* }}} */
 
-static zend_long php_extract_if_exists(const zend_array *arr, const zend_array *symbol_table) /* {{{ */
+static zend_long php_extract_if_exists(const zend_array *arr, const zend_array *symbol_table, bool strict) /* {{{ */
 {
 	zend_long count = 0;
 	zend_string *var_name;
@@ -1792,7 +1822,7 @@ static zend_long php_extract_if_exists(const zend_array *arr, const zend_array *
 				return -1;
 			}
 			ZVAL_DEREF(entry);
-			ZEND_TRY_ASSIGN_COPY_EX(orig_var, entry, 0);
+			ZEND_TRY_ASSIGN_COPY_EX(orig_var, entry, strict);
 			if (UNEXPECTED(EG(exception))) {
 				return -1;
 			}
@@ -1856,7 +1886,7 @@ static zend_long php_extract_ref_overwrite(const zend_array *arr, zend_array *sy
 }
 /* }}} */
 
-static zend_long php_extract_overwrite(const zend_array *arr, zend_array *symbol_table) /* {{{ */
+static zend_long php_extract_overwrite(const zend_array *arr, zend_array *symbol_table, bool strict) /* {{{ */
 {
 	zend_long count = 0;
 	zend_string *var_name;
@@ -1885,7 +1915,7 @@ static zend_long php_extract_overwrite(const zend_array *arr, zend_array *symbol
 				continue;
 			}
 			ZVAL_DEREF(entry);
-			ZEND_TRY_ASSIGN_COPY_EX(orig_var, entry, 0);
+			php_extract_assign_typed(orig_var, entry, strict);
 			if (UNEXPECTED(EG(exception))) {
 				return -1;
 			}
@@ -1958,7 +1988,7 @@ static zend_long php_extract_ref_prefix_if_exists(const zend_array *arr, zend_ar
 }
 /* }}} */
 
-static zend_long php_extract_prefix_if_exists(const zend_array *arr, zend_array *symbol_table, const zend_string *prefix) /* {{{ */
+static zend_long php_extract_prefix_if_exists(const zend_array *arr, zend_array *symbol_table, const zend_string *prefix, bool strict) /* {{{ */
 {
 	zend_long count = 0;
 	zend_string *var_name;
@@ -1976,7 +2006,13 @@ static zend_long php_extract_prefix_if_exists(const zend_array *arr, zend_array 
 			if (Z_TYPE_P(orig_var) == IS_INDIRECT) {
 				orig_var = Z_INDIRECT_P(orig_var);
 				if (Z_TYPE_P(orig_var) == IS_UNDEF) {
-					ZVAL_COPY_DEREF(orig_var, entry);
+					/* The bare name resolves to a declared-but-unset slot; initialize it in
+					 * place, type-checked if it is a typed local. */
+					ZVAL_DEREF(entry);
+					php_extract_assign_typed(orig_var, entry, strict);
+					if (UNEXPECTED(EG(exception))) {
+						return -1;
+					}
 					count++;
 					continue;
 				}
@@ -1991,7 +2027,7 @@ static zend_long php_extract_prefix_if_exists(const zend_array *arr, zend_array 
 					if (Z_TYPE_P(orig_var) == IS_INDIRECT) {
 						orig_var = Z_INDIRECT_P(orig_var);
 					}
-					ZEND_TRY_ASSIGN_COPY_EX(orig_var, entry, 0);
+					php_extract_assign_typed(orig_var, entry, strict);
 					if (UNEXPECTED(EG(exception))) {
 						zend_string_release_ex(final_name, 0);
 						return -1;
@@ -2085,7 +2121,7 @@ prefix:;
 }
 /* }}} */
 
-static zend_long php_extract_prefix_same(const zend_array *arr, zend_array *symbol_table, const zend_string *prefix) /* {{{ */
+static zend_long php_extract_prefix_same(const zend_array *arr, zend_array *symbol_table, const zend_string *prefix, bool strict) /* {{{ */
 {
 	zend_long count = 0;
 	zend_string *var_name;
@@ -2106,7 +2142,13 @@ static zend_long php_extract_prefix_same(const zend_array *arr, zend_array *symb
 			if (Z_TYPE_P(orig_var) == IS_INDIRECT) {
 				orig_var = Z_INDIRECT_P(orig_var);
 				if (Z_TYPE_P(orig_var) == IS_UNDEF) {
-					ZVAL_COPY_DEREF(orig_var, entry);
+					/* The bare name resolves to a declared-but-unset slot; initialize it in
+					 * place, type-checked if it is a typed local. */
+					ZVAL_DEREF(entry);
+					php_extract_assign_typed(orig_var, entry, strict);
+					if (UNEXPECTED(EG(exception))) {
+						return -1;
+					}
 					count++;
 					continue;
 				}
@@ -2122,7 +2164,7 @@ prefix:;
 					if (Z_TYPE_P(orig_var) == IS_INDIRECT) {
 						orig_var = Z_INDIRECT_P(orig_var);
 					}
-					ZEND_TRY_ASSIGN_COPY_EX(orig_var, entry, 0);
+					php_extract_assign_typed(orig_var, entry, strict);
 					if (UNEXPECTED(EG(exception))) {
 						zend_string_release_ex(final_name, false);
 						return -1;
@@ -2198,7 +2240,7 @@ static zend_long php_extract_ref_prefix_all(const zend_array *arr, zend_array *s
 }
 /* }}} */
 
-static zend_long php_extract_prefix_all(const zend_array *arr, zend_array *symbol_table, const zend_string *prefix) /* {{{ */
+static zend_long php_extract_prefix_all(const zend_array *arr, zend_array *symbol_table, const zend_string *prefix, bool strict) /* {{{ */
 {
 	zend_long count = 0;
 	zend_string *var_name;
@@ -2226,7 +2268,7 @@ static zend_long php_extract_prefix_all(const zend_array *arr, zend_array *symbo
 				if (Z_TYPE_P(orig_var) == IS_INDIRECT) {
 					orig_var = Z_INDIRECT_P(orig_var);
 				}
-				ZEND_TRY_ASSIGN_COPY_EX(orig_var, entry, 0);
+				php_extract_assign_typed(orig_var, entry, strict);
 				if (UNEXPECTED(EG(exception))) {
 					zend_string_release_ex(final_name, false);
 					return -1;
@@ -2300,7 +2342,7 @@ static zend_long php_extract_ref_prefix_invalid(const zend_array *arr, zend_arra
 }
 /* }}} */
 
-static zend_long php_extract_prefix_invalid(const zend_array *arr, zend_array *symbol_table, const zend_string *prefix) /* {{{ */
+static zend_long php_extract_prefix_invalid(const zend_array *arr, zend_array *symbol_table, const zend_string *prefix, bool strict) /* {{{ */
 {
 	zend_long count = 0;
 	zend_string *var_name;
@@ -2337,7 +2379,7 @@ static zend_long php_extract_prefix_invalid(const zend_array *arr, zend_array *s
 			if (Z_TYPE_P(orig_var) == IS_INDIRECT) {
 				orig_var = Z_INDIRECT_P(orig_var);
 			}
-			ZEND_TRY_ASSIGN_COPY_EX(orig_var, entry, 0);
+			php_extract_assign_typed(orig_var, entry, strict);
 			if (UNEXPECTED(EG(exception))) {
 				zend_string_release_ex(final_name, false);
 				return -1;
@@ -2515,27 +2557,32 @@ PHP_FUNCTION(extract)
 				break;
 		}
 	} else {
+		/* When writing into typed local variables, the value is type-checked using the
+		 * strict_types mode of the userland frame that called extract(), mirroring how a
+		 * dynamic write ($$name = ...) into a typed local is checked. For an untyped target
+		 * the flag is ignored and a plain copy is performed. */
+		bool strict = ZEND_ARG_USES_STRICT_TYPES();
 		/* The array might be stored in a local variable that will be overwritten */
 		zval array_copy;
 		ZVAL_COPY(&array_copy, var_array_param);
 		switch (extract_type) {
 			case PHP_EXTR_IF_EXISTS:
-				count = php_extract_if_exists(Z_ARRVAL(array_copy), symbol_table);
+				count = php_extract_if_exists(Z_ARRVAL(array_copy), symbol_table, strict);
 				break;
 			case PHP_EXTR_OVERWRITE:
-				count = php_extract_overwrite(Z_ARRVAL(array_copy), symbol_table);
+				count = php_extract_overwrite(Z_ARRVAL(array_copy), symbol_table, strict);
 				break;
 			case PHP_EXTR_PREFIX_IF_EXISTS:
-				count = php_extract_prefix_if_exists(Z_ARRVAL(array_copy), symbol_table, prefix);
+				count = php_extract_prefix_if_exists(Z_ARRVAL(array_copy), symbol_table, prefix, strict);
 				break;
 			case PHP_EXTR_PREFIX_SAME:
-				count = php_extract_prefix_same(Z_ARRVAL(array_copy), symbol_table, prefix);
+				count = php_extract_prefix_same(Z_ARRVAL(array_copy), symbol_table, prefix, strict);
 				break;
 			case PHP_EXTR_PREFIX_ALL:
-				count = php_extract_prefix_all(Z_ARRVAL(array_copy), symbol_table, prefix);
+				count = php_extract_prefix_all(Z_ARRVAL(array_copy), symbol_table, prefix, strict);
 				break;
 			case PHP_EXTR_PREFIX_INVALID:
-				count = php_extract_prefix_invalid(Z_ARRVAL(array_copy), symbol_table, prefix);
+				count = php_extract_prefix_invalid(Z_ARRVAL(array_copy), symbol_table, prefix, strict);
 				break;
 			default:
 				count = php_extract_skip(Z_ARRVAL(array_copy), symbol_table);
