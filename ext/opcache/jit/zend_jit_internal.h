@@ -126,6 +126,48 @@ static zend_always_inline bool zend_jit_same_addr(zend_jit_addr addr1, zend_jit_
 	return false;
 }
 
+/* True if `opline`'s op1 is a typed local variable (a CV with a synthesized type in
+ * op_array->cv_types). Reference-creating ops over such a CV must run the VM handler so
+ * the typed local's type source is attached to the created zend_reference (and balanced
+ * by i_free_compiled_variables()); the JIT's inline ref-creation does not do this, so the
+ * dispatch bails those ops to the handler for typed CVs. */
+static zend_always_inline bool zend_jit_op1_is_typed_cv(const zend_op *opline, const zend_op_array *op_array)
+{
+	return opline->op1_type == IS_CV
+		&& op_array->cv_types != NULL
+		&& op_array->cv_types[EX_VAR_TO_NUM(opline->op1.var)] != NULL;
+}
+
+/* A reference-creating opcode aliases a CV into a zend_reference. When that CV is an
+ * uninitialized typed local, the VM handler throws "Cannot access uninitialized local
+ * variable ... by reference". zend_may_throw() does not model this (taking a reference
+ * to an uninitialized *untyped* CV does not throw), so the JIT would skip the post-handler
+ * exception check and run on with a pending exception. Force the check for these opcodes
+ * whenever the op_array has any typed locals (the typed CV may be in op1, op2, or OP_DATA);
+ * the check is harmless for the untyped-operand case and these are cold ref-creation ops. */
+static zend_always_inline bool zend_jit_ref_op_may_throw_uninit_typed_cv(const zend_op *opline, const zend_op_array *op_array)
+{
+	if (op_array->cv_types == NULL) {
+		return false;
+	}
+	switch (opline->opcode) {
+		case ZEND_ASSIGN_REF:
+		case ZEND_ASSIGN_OBJ_REF:
+		case ZEND_ASSIGN_STATIC_PROP_REF:
+		case ZEND_ADD_ARRAY_ELEMENT:
+		case ZEND_BIND_LEXICAL:
+		case ZEND_YIELD:
+		case ZEND_MAKE_REF:
+		case ZEND_SEND_REF:
+		case ZEND_SEND_VAR_EX:
+		case ZEND_SEND_VAR_NO_REF_EX:
+		case ZEND_SEND_FUNC_ARG:
+			return true;
+		default:
+			return false;
+	}
+}
+
 typedef struct _zend_jit_op_array_extension {
 	zend_func_info func_info;
 	const zend_op_array *op_array;
