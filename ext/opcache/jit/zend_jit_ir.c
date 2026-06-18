@@ -3086,6 +3086,7 @@ static void zend_jit_setup_disasm(void)
 	REGISTER_HELPER(zend_jit_pre_dec_typed_ref);
 	REGISTER_HELPER(zend_jit_post_inc_typed_ref);
 	REGISTER_HELPER(zend_jit_post_dec_typed_ref);
+	REGISTER_HELPER(zend_jit_del_cv_type_source);
 	REGISTER_HELPER(zend_jit_pre_inc);
 	REGISTER_HELPER(zend_jit_pre_dec);
 	REGISTER_HELPER(zend_jit_add_arrays_helper);
@@ -11046,6 +11047,20 @@ static int zend_jit_free_cv(zend_jit_ctx *jit, uint32_t info, uint32_t var)
 
 		jit_ZVAL_PTR_DTOR(jit, var_addr, info, true, NULL);
 	}
+	return 1;
+}
+
+/* Emit the per-slot typed-local type-source removal that i_free_compiled_variables() does:
+ * zend_jit_del_cv_type_source(EX_VAR(var), info). Used at the tracing-JIT return teardown,
+ * where the unrolled per-CV free (which correctly skips a moved-out return-value CV) is kept
+ * but must still drop a typed local's type source from any reference it was aliased into. */
+static int zend_jit_del_typed_cv_ref_source(zend_jit_ctx *jit, zend_property_info *info, uint32_t var)
+{
+	zend_jit_addr var_addr = ZEND_ADDR_MEM_ZVAL(ZREG_FP, EX_NUM_TO_VAR(var));
+
+	ir_CALL_2(IR_VOID, ir_CONST_FC_FUNC(zend_jit_del_cv_type_source),
+		jit_ZVAL_ADDR(jit, var_addr),
+		ir_CONST_ADDR(info));
 	return 1;
 }
 

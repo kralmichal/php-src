@@ -2485,15 +2485,34 @@ static zend_property_info *zend_jit_get_prop_not_accepting_double(zend_reference
 	return NULL;
 }
 
+/* Remove a typed local's synthesized type source from the reference its CV slot holds, at
+ * frame teardown. Mirrors the per-slot DEL in i_free_compiled_variables(): only acts when
+ * the slot actually holds a reference that still carries type sources, keeping the ADD (at
+ * reference-creation time) and this DEL balanced one-per-CV-slot. `cv` is the raw CV slot. */
+static void ZEND_FASTCALL zend_jit_del_cv_type_source(zval *cv, zend_property_info *info)
+{
+	if (EXPECTED(Z_ISREF_P(cv)) && ZEND_REF_HAS_TYPE_SOURCES(Z_REF_P(cv))) {
+		ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(cv), info);
+	}
+}
+
 static ZEND_COLD void zend_jit_throw_inc_ref_error(zend_reference *ref, zend_property_info *error_prop)
 {
 	zend_string *type_str = zend_type_to_string(error_prop->type);
 
-	zend_type_error(
-		"Cannot increment a reference held by property %s::$%s of type %s past its maximal value",
-		ZSTR_VAL(error_prop->ce->name),
-		zend_get_unmangled_property_name(error_prop->name),
-		ZSTR_VAL(type_str));
+	if (error_prop->ce) {
+		zend_type_error(
+			"Cannot increment a reference held by property %s::$%s of type %s past its maximal value",
+			ZSTR_VAL(error_prop->ce->name),
+			zend_get_unmangled_property_name(error_prop->name),
+			ZSTR_VAL(type_str));
+	} else {
+		/* Synthesized info for a typed local variable (ce == NULL). */
+		zend_type_error(
+			"Cannot increment a reference held by local variable $%s of type %s past its maximal value",
+			ZSTR_VAL(error_prop->name),
+			ZSTR_VAL(type_str));
+	}
 	zend_string_release(type_str);
 }
 
@@ -2501,11 +2520,19 @@ static ZEND_COLD void zend_jit_throw_dec_ref_error(zend_reference *ref, zend_pro
 {
 	zend_string *type_str = zend_type_to_string(error_prop->type);
 
-	zend_type_error(
-		"Cannot decrement a reference held by property %s::$%s of type %s past its minimal value",
-		ZSTR_VAL(error_prop->ce->name),
-		zend_get_unmangled_property_name(error_prop->name),
-		ZSTR_VAL(type_str));
+	if (error_prop->ce) {
+		zend_type_error(
+			"Cannot decrement a reference held by property %s::$%s of type %s past its minimal value",
+			ZSTR_VAL(error_prop->ce->name),
+			zend_get_unmangled_property_name(error_prop->name),
+			ZSTR_VAL(type_str));
+	} else {
+		/* Synthesized info for a typed local variable (ce == NULL). */
+		zend_type_error(
+			"Cannot decrement a reference held by local variable $%s of type %s past its minimal value",
+			ZSTR_VAL(error_prop->name),
+			ZSTR_VAL(type_str));
+	}
 	zend_string_release(type_str);
 }
 
