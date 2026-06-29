@@ -418,6 +418,8 @@ PHP_NEW_EXTENSION([standard], m4_normalize([
     image.c
     incomplete_class.c
     info.c
+    int.c
+    float.c
     io_poll.c
     iptc.c
     levenshtein.c
@@ -439,6 +441,7 @@ PHP_NEW_EXTENSION([standard], m4_normalize([
     sha1.c
     soundex.c
     streamsfuncs.c
+    str.c
     string.c
     strnatcmp.c
     syslog.c
