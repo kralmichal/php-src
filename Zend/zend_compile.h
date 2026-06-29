@@ -1061,6 +1061,39 @@ ZEND_API zend_string *zend_type_to_string(zend_type type);
 #define ZEND_NAME_NOT_FQ   1
 #define ZEND_NAME_RELATIVE 2
 
+/* Internal-only name of the backing class for scalar string methods (the dispatch
+ * target the compiler desugars `<string>->method()` into). It begins with a NUL byte
+ * so it is unrepresentable as a userland identifier: userland `class Str {}` registers
+ * under "str" and never collides, `class_exists('Str')` and Reflection-by-"Str" miss it,
+ * and `get_declared_classes()` already excludes class-table keys whose first byte is NUL
+ * (matching the anonymous-class convention). The class is still a real internal class so
+ * the compiler can introspect method return types for chaining; the desugar references
+ * this name (not a baked CE pointer), so it is resolved at runtime through the normal
+ * static-call cache slot and is opcache-safe under SHM and file_cache. All three sites
+ * (registration, desugar reference, return-type read) must agree on these exact bytes. */
+#define ZEND_STR_SCALAR_METHODS_CLASS_NAME    "\0Str"
+#define ZEND_STR_SCALAR_METHODS_CLASS_NAME_LEN (sizeof(ZEND_STR_SCALAR_METHODS_CLASS_NAME) - 1)
+
+/* Internal-only name of the backing class for scalar *int* methods, mirroring the
+ * string `Str` scheme above exactly: the leading NUL byte makes "Int" userland-
+ * unrepresentable, so userland `class Int {}` registers under "int" and never collides,
+ * `class_exists('Int')` and Reflection-by-"Int" miss it, and `get_declared_classes()`
+ * already excludes NUL-prefixed class-table keys. The int desugar references this name
+ * (not a baked CE pointer), resolved at runtime through the static-call cache slot and
+ * opcache-safe under SHM and file_cache. Registration, desugar reference and return-type
+ * reads must all agree on these exact bytes. */
+#define ZEND_STR_SCALAR_METHODS_INT_CLASS_NAME    "\0Int"
+#define ZEND_STR_SCALAR_METHODS_INT_CLASS_NAME_LEN (sizeof(ZEND_STR_SCALAR_METHODS_INT_CLASS_NAME) - 1)
+
+/* Internal-only name of the backing class for scalar *float* methods, same NUL-prefixed scheme
+ * as Str/Int. Like `int` (and unlike `str`), `float` is a reserved class name, so a userland
+ * `class Float {}` is already a fatal error independent of this feature — there is no userland
+ * `Float` to collide with. The leading NUL additionally makes the backing class invisible:
+ * class_exists('Float') / Reflection / get_declared_classes() all miss the NUL-keyed entry. The
+ * float desugar references this name (not a baked CE pointer), opcache-safe under SHM/file_cache. */
+#define ZEND_STR_SCALAR_METHODS_FLOAT_CLASS_NAME    "\0Float"
+#define ZEND_STR_SCALAR_METHODS_FLOAT_CLASS_NAME_LEN (sizeof(ZEND_STR_SCALAR_METHODS_FLOAT_CLASS_NAME) - 1)
+
 /* ZEND_FETCH_ flags in class name AST of new const expression must not clash with ZEND_NAME_ flags */
 #define ZEND_CONST_EXPR_NEW_FETCH_TYPE_SHIFT 2
 
