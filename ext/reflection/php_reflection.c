@@ -7056,6 +7056,14 @@ ZEND_METHOD(ReflectionExtension, getINIEntries)
 /* {{{ add_extension_class */
 static void add_extension_class(zend_class_entry *ce, zend_string *key, zval *class_array, const zend_module_entry *module, bool add_reflection_class)
 {
+	/* Skip classes registered under a name whose first byte is NUL. Such names are
+	 * userland-unrepresentable internal-only classes (the scalar-method backing class,
+	 * matching the anonymous-class convention) and are intentionally invisible to
+	 * userland introspection, exactly as get_declared_classes() already excludes them. */
+	if (ZSTR_LEN(key) == 0 || ZSTR_VAL(key)[0] == '\0') {
+		return;
+	}
+
 	if (ce->type == ZEND_INTERNAL_CLASS && ce->info.internal.module && !strcasecmp(ce->info.internal.module->name, module->name)) {
 		zend_string *name;
 
