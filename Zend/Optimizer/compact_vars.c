@@ -52,6 +52,18 @@ void zend_optimizer_compact_vars(zend_op_array *op_array) {
 		}
 	}
 
+	/* A typed local (cv_types[i] != NULL) must be kept even if no CV operand references it:
+	 * its declared type is enforced on by-name writes ($$name, extract()) through its
+	 * symbol-table IS_INDIRECT entry, and dropping the CV would silently discard the type and
+	 * turn such a write into an unchecked plain-variable create. Mark these CVs as used. */
+	if (op_array->cv_types) {
+		for (i = 0; i < op_array->last_var; i++) {
+			if (op_array->cv_types[i]) {
+				zend_bitset_incl(used_vars, i);
+			}
+		}
+	}
+
 	num_cvs = 0;
 	for (i = 0; i < op_array->last_var; i++) {
 		if (zend_bitset_in(used_vars, i)) {
@@ -93,25 +105,43 @@ void zend_optimizer_compact_vars(zend_op_array *op_array) {
 		}
 	}
 
-	/* Update CV name table */
+	/* Update CV name table (and the parallel cv_types table for typed locals) */
 	if (num_cvs != op_array->last_var) {
 		if (num_cvs) {
 			zend_string **names = safe_emalloc(sizeof(zend_string *), num_cvs, 0);
+			/* cv_types[] is parallel to vars[] and must be permuted the same way. All typed
+			 * CVs were marked used above, so every non-NULL entry survives; only NULL entries
+			 * (untyped, possibly dropped) are discarded. */
+			zend_property_info **types = NULL;
+			if (op_array->cv_types) {
+				types = ecalloc(num_cvs, sizeof(zend_property_info *));
+			}
 			for (i = 0; i < op_array->last_var; i++) {
 				if (vars_map[i] != (uint32_t) -1) {
 					names[vars_map[i]] = op_array->vars[i];
+					if (types) {
+						types[vars_map[i]] = op_array->cv_types[i];
+					}
 				} else {
 					zend_string_release_ex(op_array->vars[i], 0);
 				}
 			}
 			efree(op_array->vars);
 			op_array->vars = names;
+			if (op_array->cv_types) {
+				efree(op_array->cv_types);
+				op_array->cv_types = types;
+			}
 		} else {
 			for (i = 0; i < op_array->last_var; i++) {
 				zend_string_release_ex(op_array->vars[i], 0);
 			}
 			efree(op_array->vars);
 			op_array->vars = NULL;
+			if (op_array->cv_types) {
+				efree(op_array->cv_types);
+				op_array->cv_types = NULL;
+			}
 		}
 		op_array->last_var = num_cvs;
 	}
